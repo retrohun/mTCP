@@ -1,5 +1,14 @@
+compile_options = -0 -oh -ok -os -s -oa -ei -zp2 -zpw -we
 
-all : patch.exe
+all : clean patch.exe
 
 patch.exe : patch.cpp
-  wcl386 patch.cpp
+  wcl patch.cpp
+
+.cpp.obj
+  wpp $[* $(compile_options)
+
+clean : .symbolic
+  del patch.exe
+  del *.o*
+  del *.map

@@ -47,7 +47,9 @@
 #include <dir.h>
 #endif
 
+#if DOSTERM == 0
 #include <bios.h>
+#endif
 #include <conio.h>
 #include <ctype.h>
 #include <direct.h>
@@ -391,7 +393,30 @@ extern void gotoxy( unsigned char col, unsigned char row );
 #endif
 
 
+#if DOSTERM == 1
+uint16_t bioskey( int intarg ) {
+    union REGS regs;
+    uint16_t returnvalue;
 
+    if(1 == intarg){
+        regs.h.ah = 0x0b;
+        intdos(&regs, &regs);
+        return(regs.h.al & 1);
+    }
+    if(0 == intarg){
+        regs.h.ah = 0x08;
+        intdos(&regs, &regs);
+        returnvalue = regs.h.al;
+        if(returnvalue == 0) {
+            regs.h.ah = 0x08;
+            intdos(&regs, &regs);
+            returnvalue = regs.h.al << 8;
+        }
+        return(returnvalue);
+    }
+    return(0);
+}
+#endif
 
 uint8_t far *Screen_base;
 uint16_t ScreenRows, ScreenCols;
@@ -407,12 +432,18 @@ void myCprintf( uint8_t x, uint8_t y, char *fmt, ... ) {
 
   cprintfBuffer[79] = 0;
 
+  #if DOSTERM == 0
   uint16_t far *start = (uint16_t far *)(Screen_base + (y*ScreenCols+x)*2);
+  #endif
 
   uint16_t len = strlen( cprintfBuffer );
 
   for ( uint16_t i = 0; i < len; i++ ) {
+    #if DOSTERM == 0
     *start++ = ( 7 << 8 | cprintfBuffer[i] );
+    #else
+    printf("%c", cprintfBuffer[i]);
+    #endif
   }
 
 }
@@ -430,10 +461,12 @@ void myCprintf( uint8_t x, uint8_t y, char *fmt, ... ) {
 static void complain( void ) { sound(500); delay( 50); nosound( ); }
 
 inline void clrLine( int x, int y  ) {
+  #if DOSTERM == 0
   uint16_t far *target = (uint16_t far *)(Screen_base + (y)*ScreenCols*2 + (x)*2 );
   uint16_t len = ScreenCols - x;
   uint16_t fillWord = ( 0x0700 | 0x20 );
   fillUsingWord( target, fillWord, len );
+  #endif
 }
 
 char previousCommands[PREVIOUS_COMMANDS][USERINPUTBUF_MAX_LEN];
@@ -483,6 +516,7 @@ int main( int argc, char *argv[] ) {
   }
 
 
+  #if DOSTERM == 0
   if ( getEgaMemSize( ) == 0x10 ) {
     // Failed.  Must be MDA or CGA
     ScreenCols = 80;
@@ -492,8 +526,10 @@ int main( int argc, char *argv[] ) {
     ScreenCols = *((unsigned char far *)MK_FP( 0x40, 0x4A ));
     ScreenRows = *((unsigned char far *)MK_FP( 0x40, 0x84 )) + 1;
   }
-
-
+  #else
+    ScreenCols = 80;
+    ScreenRows = 25;
+  #endif
 
   initCommandHistory( );
 
@@ -2484,9 +2520,14 @@ int8_t receiveFile( void ) {
   uint16_t bytesRead = 0;
   uint16_t bytesToRead = RecvFileBufSize;
 
+  #if DOSTERM == 0
   int x = wherex( );
   int y = wherey( );
-  
+  #else
+  int x = 1;
+  int y = 1;
+  #endif
+
   uint8_t update = 0;
 
   uint8_t done = 0;
@@ -2548,7 +2589,9 @@ int8_t receiveFile( void ) {
 
   } // end while
 
+  #if DOSTERM == 0
   gotoxy( x, y );
+  #endif
 
   // Flush remaining bytes
   if ( bytesRead ) {
@@ -2632,9 +2675,13 @@ int8_t sendFile( void ) {
 
   uint32_t totalBytesSent = 0;
 
+  #if DOSTERM == 0
   int x = wherex( );
   int y = wherey( );
-
+  #else
+  int x = 1;
+  int y = 1;
+  #endif
   uint8_t update = 0;
 
   DataBuf *buf = NULL;
@@ -2823,7 +2870,9 @@ int8_t sendFile( void ) {
   } // end main while
 
 
+  #if DOSTERM == 0
   gotoxy( x, y );
+  #endif
 
   if ( done == 2 ) {
     printf( "Data socket closed early - close reason: %d\n", DataSocket->getCloseReason( ) );
@@ -3059,7 +3108,9 @@ void drawCursor( int startX, int startY, int offset ) {
     startX = startX - ScreenCols;
     startY++;
   }
+  #if DOSTERM == 0
   gotoxy( startX, startY );
+  #endif
 }
 
 
@@ -3098,8 +3149,13 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
 
 
   // Remember the row and column that we start at so that we can preserve the prompt.
-  int startY = wherey( );
+  #if DOSTERM == 0
   int startX = wherex( );
+  int startY = wherey( );
+  #else
+  int startX = 1;
+  int startY = 1;
+  #endif
 
   // Remember if we roll into a second line so we can refresh/erase it if needed.
   bool spanningTwoLines = false;
@@ -3166,7 +3222,9 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
             bufferIdx = bufferLen;
 
             clearInputArea( startX, startY, 0, spanningTwoLines );
+            #if DOSTERM == 0
             gotoxy( startX, startY );
+            #endif
             cputs( buffer );
 
 
@@ -3179,9 +3237,11 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
 
             if ( bufferIdx + startX > (ScreenCols-1) ) {
               spanningTwoLines = true;
+              #if DOSTERM == 0
               if ( (startY == (ScreenRows-1)) && (wherey( ) == (ScreenRows-1)) ) {
                 startY--;
               }
+              #endif
             }
 
             break;
@@ -3204,7 +3264,9 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
             bufferIdx = bufferLen;
 
             clearInputArea( startX, startY, 0, spanningTwoLines );
+            #if DOSTERM == 0
             gotoxy( startX, startY );
+            #endif
             cputs( buffer );
 
 
@@ -3212,9 +3274,11 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
 
             if ( bufferIdx + startX > (ScreenCols-1) ) {
               spanningTwoLines = true;
+              #if DOSTERM == 0
               if ( (startY == (ScreenRows-1)) && (wherey( ) == (ScreenRows-1)) ) {
                 startY--;
               }
+              #endif
             }
 
             break;
@@ -3300,7 +3364,9 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
           bufferIdx = bufferLen = 0;
           buffer[ 0 ] = 0;
           clearInputArea( startX, startY, 0, spanningTwoLines );
+          #if DOSTERM == 0
           gotoxy( startX, startY );
+          #endif
         }
 
         else if ( ((c > 31) && ( c < 127 )) || (c>127) ) {
@@ -3368,6 +3434,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
 
           // Detect if we moved down a line and/or scrolled the screen
 
+          #if DOSTERM == 0
           if ( wherex( ) == 0 ) {
             spanningTwoLines = true;
             if ( startY == (ScreenRows-1) ) {
@@ -3375,6 +3442,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
               startY--;
             }
           }
+          #endif
 
           drawCursor( startX, startY, bufferIdx );
 

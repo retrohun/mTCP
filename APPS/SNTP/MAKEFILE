@@ -21,9 +21,9 @@
 
 # For this code performance is not an issue.  Make it small.
 
-tcp_h_dir = ..\..\TCPINC\
-tcp_c_dir = ..\..\TCPLIB\
-common_h_dir = ..\..\INCLUDE
+tcp_h_dir = TI\
+tcp_c_dir = TL\
+common_h_dir = I
 
 memory_model = -ms
 compile_options = -0 $(memory_model) -DCFG_H="sntp.cfg" -oh -ok -os -s -oa -ei -zp2 -zpw -we

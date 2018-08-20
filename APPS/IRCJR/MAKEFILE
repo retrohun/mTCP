@@ -25,9 +25,9 @@
 # This code is not performance sensitive.  Do what you can, but don't bloat
 # it out and require us to move to a larger memory model.
 
-tcp_h_dir = ..\..\TCPINC\
-tcp_c_dir = ..\..\TCPLIB\
-common_h_dir = ..\..\INCLUDE
+tcp_h_dir = TI\
+tcp_c_dir = TL\
+common_h_dir = I
 
 memory_model = -ml
 compile_options = -0 $(memory_model) -DCFG_H="irc.cfg" -oh -ok -os -s -oa -ei -zp2 -zpw -we -ob
