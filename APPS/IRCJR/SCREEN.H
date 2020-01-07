@@ -2,7 +2,7 @@
 /*
 
    mTCP Screen.h
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -38,6 +38,7 @@
 #include <stdarg.h>
 
 #include "types.h"
+#include "inlines.h"
 #include "ircjr.h"
 
 
@@ -81,6 +82,7 @@ class Screen {
 
     static inline void clearRows( uint16_t startRow, uint16_t rows ) {
       uint16_t *startAddr = (uint16_t far *)(screenBase) + startRow*screenCols;
+      if ( preventSnow ) { waitForCGARetraceLong( ); }
       fillUsingWord( startAddr, (scNormal<<8|32), rows*screenCols);
     }
 
@@ -110,10 +112,12 @@ class Screen {
     // Interrogators
 
     static inline bool          isColorCard( void ) { return colorMode; }
+    static inline bool          isPreventSnowOn( void ) { return preventSnow; }
 
     static inline uint16_t      getSeparatorRow( void ) { return separatorRow; }
     static inline uint16_t      getOutputRows( void ) { return outputRows; }
 
+    static inline uint16_t      getScreenBaseSeg( void ) { return screenBaseSeg; }
     static inline uint8_t far * getScreenBase( void ) { return screenBase; }
     static inline uint8_t far * getSeparatorRowAddress( void ) { return separatorRowAddr; }
 
@@ -138,10 +142,11 @@ class Screen {
     static void printf_internal( uint16_t x, uint16_t y, uint8_t attr, char *fmt, va_list ap );
 
 
-
     static uint8_t far *screenBase;          // Memory address of the top of the screen
     static uint8_t far *separatorRowAddr;    // Memory address of the separator row
     static uint8_t far *inputAreaStart;      // Memory address of the top of the user input area
+
+    static uint16_t screenBaseSeg;           // Segment of the screen base
 
     static uint16_t screenRows;              // Total number of rows on the screen
     static uint16_t screenCols;              // Total number of columns on the screen
@@ -158,6 +163,8 @@ class Screen {
     static bool insertMode;
     static bool eatNextChar;
     static bool colorPopup;
+
+    static bool preventSnow;
 
 };
 

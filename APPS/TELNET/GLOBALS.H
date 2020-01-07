@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Globals.h
-   Copyright (C) 2012-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -98,13 +97,12 @@ extern uint8_t scErr;
 extern uint8_t scNormal;
 extern uint8_t scBright;
 
-extern char *extraBuffer;
 
 
-extern int16_t  processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize );
+extern int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize );
 extern void setTelnetBinaryMode( bool binaryMode );
 
-extern uint8_t RawOrTelnet;
+extern bool RawOrTelnet;
 
 
 #endif

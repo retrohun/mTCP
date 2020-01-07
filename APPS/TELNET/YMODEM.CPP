@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ymodem.cpp
-   Copyright (C) 2012-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,9 +26,14 @@
    Changes:
 
    2012-04-29: Created when xmodem and ymodem were added
+   2015-01-22: Add 132 column support
+
 
 */
 
+
+
+#include CFG_H
 
 #ifdef FILEXFER
 
@@ -43,6 +47,7 @@
 
 #include "types.h"
 
+#include "trace.h"
 #include "utils.h"
 #include "packet.h"
 #include "arp.h"
@@ -183,7 +188,7 @@ void xmodem_crcInit(void) {
 
   uint16_t remainder;
   int      dividend;
-  uint8_t  bit;
+  uint16_t  bit;
 
   for (dividend = 0; dividend < 256; ++dividend) {
 
@@ -269,6 +274,23 @@ void initForXmodem( void ) {
 
 static int8_t transfer_SendByte( uint8_t data ) {
 
+  // If there is no room in the outgoing queue then do some processing
+  // to make some room.  This should not happen.
+
+  while ( mySocket->outgoingQueueIsFull( ) ) {
+
+    if ( mySocket->isRemoteClosed( ) ) {
+      // Whoops.  We are done ...
+      return 1;
+    }
+
+    PACKET_PROCESS_SINGLE;
+    Arp::driveArp( );
+    Tcp::drivePackets( );
+    
+  }
+
+
   DataBuf *buf;
 
   while ( (buf = (DataBuf *)TcpBuffer::getXmitBuf( )) == NULL ) {
@@ -288,14 +310,19 @@ static int8_t transfer_SendByte( uint8_t data ) {
   }
 
 
-
+  // Great.  We have an outgoing buffer and we know we can send it.
   
   buf->b.dataLen = 1;
   buf->data[0] = data;
 
-  // Fixme: check return code.  Need to recycle this buffer if it
-  // was not accepted.
-  mySocket->enqueue( &buf->b );
+  if ( mySocket->enqueue( &buf->b ) != 0 ) {
+    // Something went wrong.  The end is near.  Put the buffer back in
+    // the pool to be correct.
+    TcpBuffer::returnXmitBuf( (TcpBuffer *)buf );
+  }
+
+
+  // Push it out!
 
   PACKET_PROCESS_SINGLE;
   Tcp::drivePackets( );
@@ -350,24 +377,30 @@ void drawBox( int ul_x, int ul_y, int lr_x, int lr_y ) {
   uint16_t attr = scFileXfer << 8;
   uint16_t middleLen = lr_x - ul_x - 1;
 
-  uint16_t far *start = (uint16_t far *)(s.Screen_base + (ul_y*80+ul_x)*2);
+  uint16_t far *start = (uint16_t far *)(s.Screen_base + (ul_y*s.terminalCols+ul_x)*2);
 
   uint16_t far *start2 = start;
+  if ( s.isPreventSnowOn( ) ) { waitForCGARetraceLong( ); }
   *start2++ = (attr|0xc9);
-  for ( int i=0; i < middleLen; i++ ) *start2++ = (attr|0xcd);
+  fillUsingWord( start2, (attr|0xcd), middleLen );
+  start2 += middleLen;
   *start2 = (attr|0xbb);
 
-  start2 = start += 80;
+  start2 = start += s.terminalCols;
 
   for ( uint8_t i=ul_y+1; i < lr_y; i++ ) {
+    if ( s.isPreventSnowOn( ) ) { waitForCGARetraceLong( ); }
     *start2++ = (attr|0xba);
-    for ( int i=0; i < middleLen; i++ ) *start2++ = (attr|' ');
+    fillUsingWord( start2, (attr|' '), middleLen );
+    start2 += middleLen;
     *start2 = (attr|0xba);
-    start2 = start += 80;
+    start2 = start += s.terminalCols;
   }
 
+  if ( s.isPreventSnowOn( ) ) { waitForCGARetraceLong( ); }
   *start++ = (attr|0xc8);
-  for ( int i=0; i < middleLen; i++ ) *start++ = (attr|0xcd);
+  fillUsingWord( start, (attr|0xcd), middleLen );
+  start += middleLen;
   *start = (attr|0xbc);
 
 
@@ -391,6 +424,31 @@ void drawBox( int ul_x, int ul_y, int lr_x, int lr_y ) {
 
 
 
+
+typedef _Packed struct {
+  uint8_t x;
+  uint8_t y;
+  char *string;
+} ProtocolMenu_t;
+
+ProtocolMenu_t ProtocolMenu[] = {
+  {  9,  9, "\xb5 Protocol \xc6" },
+  {  8, 11, "1) Xmodem" },
+  {  8, 12, "2) Xmodem CRC" },
+  {  8, 13, "3) Xmodem 1K" },
+  {  8, 14, "4) Ymodem Batch" },
+#ifdef YMODEM_G
+  {  8, 15, "5) Ymodem G" },
+  {  6, 17, "ESC) Cancel" },
+  {  6, 19, "Protocol:" },
+#else
+  {  6, 16, "ESC) Cancel" },
+  {  6, 18, "Protocol:" },
+#endif
+  { 99,  0, "" }
+};
+
+
 void drawProtocolMenu( void ) {
 
   #ifdef YMODEM_G
@@ -399,21 +457,15 @@ void drawProtocolMenu( void ) {
   drawBox( 4, 9, 24, 20 );
   #endif
 
-  s.myCprintf( 9,  9, scFileXfer, "\xb5 Protocol \xc6" );
-  s.myCprintf( 8, 11, scFileXfer, "1) Xmodem" );
-  s.myCprintf( 8, 12, scFileXfer, "2) Xmodem CRC" );
-  s.myCprintf( 8, 13, scFileXfer, "3) Xmodem 1K" );
-  s.myCprintf( 8, 14, scFileXfer, "4) Ymodem Batch" );
+  int i = 0;
+  while ( ProtocolMenu[i].x != 99 ) {
+    s.myCprintf( ProtocolMenu[i].x, ProtocolMenu[i].y, scFileXfer, ProtocolMenu[i].string );
+    i++;
+  }
 
   #ifdef YMODEM_G
-  s.myCprintf( 8, 15, scFileXfer, "5) Ymodem G" );
-  s.myCprintf( 6, 17, scFileXfer, "ESC) Cancel" );
-  s.myCprintf( 6, 19, scFileXfer, "Protocol:" );
   gotoxy( 16, 19 );
   #else
-  s.myCprintf( 6, 16, scFileXfer, "ESC) Cancel" );
-  s.myCprintf( 6, 18, scFileXfer,   "Protocol:" );
-  gotoxy( 16, 18 );
   #endif
 }
 
@@ -507,7 +559,7 @@ static void endTransfer( bool isErr, bool sendCancels, char *finalMsg ) {
 
   SocketInputMode = SocketInputMode_t::Telnet;
   UserInputMode = UserInputMode_t::Help;
-  s.updateRealScreen = 0;
+  s.doNotUpdateRealScreen( );
 
   setTelnetBinaryMode( false );
 }
@@ -735,7 +787,7 @@ void processUserInput_ClobberDialog( Key_t key ) {
     else if ( key.normalKey == 'N' || key.normalKey == 'n' ) {
       SocketInputMode = SocketInputMode_t::Telnet;
       UserInputMode = UserInputMode_t::Help;
-      s.updateRealScreen = 0;
+      s.doNotUpdateRealScreen( );
     }
   }
   else {
@@ -801,20 +853,20 @@ void processUserInput_Filename( Key_t key ) {
           UserInputMode = UserInputMode_t::ClobberDialog;
         }
         else {
-          gotoxy( 8, 14 ); s.myCprintf( scErr, "Can't overwrite that!" );
+          s.myCprintf( 8, 14, scErr, "Can't overwrite that!" );
           SocketInputMode = SocketInputMode_t::Telnet;
           UserInputMode = UserInputMode_t::Help;
-          s.updateRealScreen = 0;
+          s.doNotUpdateRealScreen( );
         }
 
       }
       else {
 
         if ( transferVars.statFileForUpload( ) ) {
-          gotoxy( 8, 14 ); s.myCprintf( scErr, "File not found!" );
+          s.myCprintf( 8, 14, scErr, "File not found!" );
           SocketInputMode = SocketInputMode_t::Telnet;
           UserInputMode = UserInputMode_t::Help;
-          s.updateRealScreen = 0;
+          s.doNotUpdateRealScreen( );
         }
         else {
           transferVars.startUpload( );
@@ -826,10 +878,10 @@ void processUserInput_Filename( Key_t key ) {
     }
     else {
 
-      gotoxy( 8, 14 ); s.myCprintf( scFileXfer, "Bad filename!" );
+      s.myCprintf( 8, 14, scFileXfer, "Bad filename!" );
       SocketInputMode = SocketInputMode_t::Telnet;
       UserInputMode = UserInputMode_t::Help;
-      s.updateRealScreen = 0;
+      s.doNotUpdateRealScreen( );
 
     }
 
@@ -1120,7 +1172,6 @@ uint16_t Transfer_vars::processSocket_UploadInternal( uint8_t *recvBuffer, uint1
       } 
       else {
 
-        // Process telnet command - Fixme, should check return code for -1
         int16_t rc = processTelnetCmds( recvBuffer, len );
 
         if ( rc > 0 ) {
@@ -1737,7 +1788,6 @@ uint16_t Transfer_vars::processSocket_DownloadInternal( uint8_t *recvBuffer, uin
         }
         else {
 
-          // Process telnet command - Fixme, should check return code for -1
           int16_t rc = processTelnetCmds( recvBuffer+index, (len-index) );
 
           if ( rc > 0 ) {

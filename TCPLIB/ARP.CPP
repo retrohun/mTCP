@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Arp.cpp
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -28,6 +27,8 @@
 
    2011-05-27: Initial release as open source software
    2013-03-23: Get rid of some duplicate strings
+   2015-02-01: Do not respond to our own queries or add our own entry
+               into the ARP cache; these are for detecting conflicts
 
 */
 
@@ -37,12 +38,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#include "Arp.h"
-#include "Eth.h"
-#include "Ip.h"
-#include "Utils.h"
-#include "Packet.h"
+#include "arp.h"
+#include "timer.h"
+#include "trace.h"
+#include "utils.h"
+#include "packet.h"
+#include "eth.h"
+#include "ip.h"
 
 
 
@@ -50,12 +54,26 @@
 // Static class variables
 
 Arp::Pending_t Arp::pending[ARP_MAX_PENDING];
-uint8_t Arp::pendingEntries = 0;
+uint16_t Arp::pendingEntries = 0;
 
 Arp::Rec_t Arp::arpTable[ARP_MAX_ENTRIES];
-uint8_t Arp::entries = 0;
+uint16_t Arp::entries = 0;
 
 
+uint32_t Arp::RequestsReceived = 0;
+uint32_t Arp::RepliesReceived = 0;
+uint32_t Arp::RequestsSent = 0;
+uint32_t Arp::RepliesSent = 0;
+uint32_t Arp::CacheModifiedCount = 0;
+uint32_t Arp::CacheEvictions = 0;
+
+
+void Arp::dumpStats( FILE *stream ) {
+  fprintf( stream, "Arp: Req Sent %lu Req Rcvd %lu Replies Sent %lu Replies Rcvd %lu\n"
+                   "     Cache updates %lu Cache evictions %lu\n",
+           RequestsSent, RequestsReceived, RepliesSent, RepliesReceived,
+           CacheModifiedCount, CacheEvictions );
+}
 
 
 
@@ -87,12 +105,9 @@ static char VanityString[] = "mTCP by M Brutman";
 
 void Arp::init( void ) {
 
-  // Initialize the pending table
-  for (uint8_t i=0; i < ARP_MAX_PENDING; i++ ) {
-    pending[i].attempts = -1;
-  }
+  clearPendingTable( );
 
-  // Are we on a slip connect?  If so, stuff the table with the gateway
+  // Are we on a slip connection?  If so, stuff the table with the gateway
   // addr.  We'll just make a dummy entry, as the actual MAC addr does
   // not matter.
 
@@ -142,22 +157,38 @@ void Arp::init( void ) {
 
 
 
+void Arp::clearPendingTable( void ) {
+  for (uint16_t i=0; i < ARP_MAX_PENDING; i++ ) {
+    pending[i].attempts = -1;
+  }
+  pendingEntries = 0;
+}
+
+
+
+#ifndef NOTRACE
+
 void Arp::dumpTable( void ) {
 
-  TRACE_ARP(( "Arp: table entries = %d\n", entries ));
+  if ( TRACE_ON_ARP ) {
 
-  for ( uint8_t i = 0; i < entries; i++ ) {
-    fprintf( TrcStream, "%02x.%02x.%02x.%02x.%02x.%02x <-> %d.%d.%d.%d %u\n",
-      arpTable[i].ethAddr[0], arpTable[i].ethAddr[1],
-      arpTable[i].ethAddr[2], arpTable[i].ethAddr[3],
-      arpTable[i].ethAddr[4], arpTable[i].ethAddr[5],
-      arpTable[i].ipAddr[0], arpTable[i].ipAddr[1],
-      arpTable[i].ipAddr[2], arpTable[i].ipAddr[3],
-      arpTable[i].updated );
+    Trace_tprintf( "Arp: table entries = %d\n", entries );
+
+    for ( uint16_t i = 0; i < entries; i++ ) {
+      fprintf( Trace_Stream, "%02x.%02x.%02x.%02x.%02x.%02x <-> %d.%d.%d.%d %u\n",
+        arpTable[i].ethAddr[0], arpTable[i].ethAddr[1],
+        arpTable[i].ethAddr[2], arpTable[i].ethAddr[3],
+        arpTable[i].ethAddr[4], arpTable[i].ethAddr[5],
+        arpTable[i].ipAddr[0], arpTable[i].ipAddr[1],
+        arpTable[i].ipAddr[2], arpTable[i].ipAddr[3],
+        arpTable[i].updated );
+    }
+
   }
 
 }
 
+#endif
 
 
 
@@ -165,13 +196,13 @@ void Arp::dumpTable( void ) {
 // Gives you an index if found
 // If you give a buffer you get the hardware address as well.
 
-int8_t Arp::findEth( const IpAddr_t target_ip, EthAddr_t *target ) {
+int8_t Arp::findEth( const IpAddr_t target_ip, EthAddr_t target ) {
 
-  for ( uint8_t i=0; i < entries; i++ ) {
+  for ( uint16_t i=0; i < entries; i++ ) {
 
     if ( Ip::isSame( arpTable[i].ipAddr, target_ip ) ) {
       if ( target != NULL ) {
-        Eth::copy( *target, arpTable[i].ethAddr );
+        Eth::copy( target, arpTable[i].ethAddr );
       }
       return i;
     }
@@ -183,13 +214,15 @@ int8_t Arp::findEth( const IpAddr_t target_ip, EthAddr_t *target ) {
 
 
 
-void Arp::processArp( const uint8_t *packet ) {
+void Arp::processArp( uint8_t *packet, uint16_t packetLen ) {
 
   ArpHeader *ah = (ArpHeader *)(packet + sizeof(EthHeader));
 
   uint16_t op = ntohs( ah->operation );
 
   if ( op == 1 ) { // Incoming ARP request
+
+    RequestsReceived++;
 
     TRACE_ARP(( "Arp: Req: %d.%d.%d.%d wants to know who %d.%d.%d.%d is\n",
                 ah->sender_ip[0], ah->sender_ip[1],
@@ -198,8 +231,9 @@ void Arp::processArp( const uint8_t *packet ) {
                 ah->target_ip[2], ah->target_ip[3] ));
 
     // Respond if we are the target, and add the requestor to our cache.
+    // Unless we made the request while trying to find impostors.
 
-    if ( Ip::isSame( ah->target_ip, MyIpAddr ) ) {
+    if ( Ip::isSame( ah->target_ip, MyIpAddr ) && !Ip::isSame( ah->sender_ip, MyIpAddr) ) {
       TRACE_ARP(( "Arp: Sending reply to %d.%d.%d.%d\n",
                   ah->sender_ip[0], ah->sender_ip[1],
                   ah->sender_ip[2], ah->sender_ip[3] ));
@@ -210,6 +244,8 @@ void Arp::processArp( const uint8_t *packet ) {
   }
   else if ( op == 2 ) { // Incoming ARP response
 
+    RepliesReceived++;
+
     TRACE_ARP(( "Arp: reply from %d.%d.%d.%d\n",
                 ah->sender_ip[0], ah->sender_ip[1],
                 ah->sender_ip[2], ah->sender_ip[3] ));
@@ -219,21 +255,26 @@ void Arp::processArp( const uint8_t *packet ) {
     //
     // If the sender or target are in our cache already, then
     // update the cache.
+    //
+    // If we ARPed ourselves we are looking for impostors.  Ignore any incoming
+    // response that has our correct MAC address; we only want things that
+    // have different addresses, and thus would be a conflict.
 
-    uint8_t pendingSatisfied = 0;
-    for ( uint8_t i=0; i < ARP_MAX_PENDING; i++ ) {
+    bool pendingSatisfied = false;
+    for ( uint16_t i=0; i < ARP_MAX_PENDING; i++ ) {
       if ( (pending[i].attempts != -1) && Ip::isSame( ah->sender_ip, pending[i].target ) ) {
-        updateOrAddCache( ah->sender_ha, ah->sender_ip );
-        pending[i].attempts = -1;
-        pendingEntries--;
-        pendingSatisfied = 1;
-        TRACE_ARP(( "Arp: reply satisfied pending req\n" ));
-        break;
+        if ( !Ip::isSame( ah->sender_ip, MyIpAddr ) || !Eth::isSame( ah->sender_ha, MyEthAddr) ) {
+          updateOrAddCache( ah->sender_ha, ah->sender_ip );
+          pending[i].attempts = -1;
+          pendingEntries--;
+          pendingSatisfied = true;
+          TRACE_ARP(( "Arp: reply satisfied pending req\n" ));
+          break;
+        }
       }
     }
 
-
-    if ( pendingSatisfied == 0 ) {
+    if ( pendingSatisfied ) {
       int8_t rc = findEth( ah->target_ip, NULL );
       if ( rc != -1 ) {
         updateEntry( rc, ah->target_ha );
@@ -246,10 +287,6 @@ void Arp::processArp( const uint8_t *packet ) {
 
   }
 
-
-  // if ( TRACE_ON_ARP && TRACE_ON_DUMP ) {
-  //   dumpTable( );
-  // }
 
   Buffer_free( packet );
 }
@@ -269,7 +306,7 @@ void Arp::driveArp2( void ) {
   // resolution, so if it never gets out of that state that should
   // give them a clue.
 
-  for ( uint8_t i=0; i < ARP_MAX_PENDING; i++ ) {
+  for ( uint16_t i=0; i < ARP_MAX_PENDING; i++ ) {
 
     if ( pending[i].attempts != -1 ) {
 
@@ -304,7 +341,7 @@ void Arp::driveArp2( void ) {
 
 
 
-void Arp::updateEntry( uint8_t index, const EthAddr_t newEthAddr ) {
+void Arp::updateEntry( uint16_t index, const EthAddr_t newEthAddr ) {
   Eth::copy( arpTable[ index ].ethAddr, newEthAddr );
   arpTable[index].updated = time( NULL );
   TRACE_ARP(( "Arp: Updated entry %d.%d.%d.%d\n",
@@ -320,6 +357,8 @@ void Arp::updateEntry( uint8_t index, const EthAddr_t newEthAddr ) {
 
 void Arp::updateOrAddCache( EthAddr_t newEthAddr, IpAddr_t newIpAddr ) {
 
+  CacheModifiedCount++;
+
   // Do we have this?
   int8_t rc = findEth( newIpAddr, NULL );
 
@@ -329,7 +368,7 @@ void Arp::updateOrAddCache( EthAddr_t newEthAddr, IpAddr_t newIpAddr ) {
     updateEntry( rc, newEthAddr );
   }
   else {
-    uint8_t target;
+    uint16_t target;
     if ( entries < ARP_MAX_ENTRIES ) {
       target = entries;
       entries++;
@@ -337,13 +376,15 @@ void Arp::updateOrAddCache( EthAddr_t newEthAddr, IpAddr_t newIpAddr ) {
     else {
       // Naive - toss the oldest.
       // Better would be to toss the least used IP addr.
-      uint8_t lowestTimeIndex = 0;
-      for ( uint8_t i=1; i < entries; i++ ) {
+      uint16_t lowestTimeIndex = 0;
+      for ( uint16_t i=1; i < entries; i++ ) {
         if ( arpTable[i].updated < arpTable[lowestTimeIndex].updated ) {
           lowestTimeIndex = i;
         }
       }
       target = lowestTimeIndex;
+
+      CacheEvictions++;
 
       TRACE_ARP_WARN(( "Arp: Throwing out table entry: %d.%d.%d.%d",
           arpTable[ target ].ipAddr[0], arpTable[ target ].ipAddr[1],
@@ -372,7 +413,7 @@ void Arp::sendArpRequest( IpAddr_t target_ip ) {
   // If there is a pending request do nothing; there is no point in
   // bombarding the network with requests.
 
-  uint8_t i;
+  uint16_t i;
   for ( i=0; i < ARP_MAX_PENDING; i++ ) {
     if ( (pending[i].attempts != -1) && Ip::isSame( pending[i].target, target_ip ) ) {
       return;
@@ -400,8 +441,10 @@ void Arp::sendArpRequest( IpAddr_t target_ip ) {
 
   Ip::copy( pending[i].target, target_ip );
   pending[i].start = TIMER_GET_CURRENT( );
-  pending[i].attempts = 1;
+  pending[i].attempts = 0;
   pendingEntries++;
+
+  RequestsSent++;
 
   sendArpRequest2( target_ip );
 
@@ -439,6 +482,8 @@ void Arp::sendArpResponse( ArpHeader *ah ) {
 
   Packet_send_pkt( &arpResponse, sizeof( arpResponse ) );
 
+  RepliesSent++;
+
   TRACE_ARP(( "Arp: Sent reply to %d.%d.%d.%d\n",
           ah->sender_ip[0], ah->sender_ip[1],
           ah->sender_ip[2], ah->sender_ip[3] ));
@@ -455,7 +500,7 @@ void Arp::sendArpResponse( ArpHeader *ah ) {
 //         1 if the packet is pending because of ARP.
 //           The ARP request is automatically sent in this case.
 
-int8_t Arp::resolve( IpAddr_t target_ip, EthAddr_t *eth_dest ) {
+int8_t Arp::resolve( IpAddr_t target_ip, EthAddr_t eth_dest ) {
 
   int8_t rc = findEth( target_ip, eth_dest );
   if ( rc != -1 ) {
@@ -465,3 +510,5 @@ int8_t Arp::resolve( IpAddr_t target_ip, EthAddr_t *eth_dest ) {
   sendArpRequest( target_ip );
   return 1;
 }
+
+

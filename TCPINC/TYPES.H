@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Types.H
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -28,6 +27,8 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2015-01-17: Move the static_assert macro here since it is almost
+               always included early.
 
 */
 
@@ -87,8 +88,10 @@ typedef union {
 
 // Common types that are going to use constantly.
 
-typedef uint8_t EthAddr_t[6];  // An Ethernet address is 6 bytes
-typedef uint8_t IpAddr_t[4];   // An IP address is 4 bytes
+typedef uint8_t  EthAddr_t[6];  // An Ethernet address is 6 bytes
+typedef uint16_t EtherType;     // 16 bits representing an Ethernet frame type
+typedef uint8_t  IpAddr_t[4];   // An IPv4 address is 4 bytes
+typedef uint8_t  Ipv6Addr_t[8]; // An IPv6 address is 8 bytes
 
 typedef uint32_t clockTicks_t; // 32 bit counter for elapsed clock ticks
 
@@ -96,6 +99,21 @@ typedef uint32_t clockTicks_t; // 32 bit counter for elapsed clock ticks
 
 
 // Useful macros
+
+
+//-----------------------------------------------------------------------------
+//
+
+// Static assert macro; used for compile-time parameter checks.  Defines an
+// empty function that should result in no code or blows up with a compile-time
+// error.
+
+#ifndef static_assert
+#define static_assert(expr) static void __static_assert( int bogusParm[(expr)?1:-1] )
+#endif
+
+
+
 
 #define QUOTEME_(x) #x
 #define QUOTEME(x) QUOTEME_(x)

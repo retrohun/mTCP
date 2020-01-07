@@ -2,7 +2,7 @@
 /*
 
    mTCP Keys.h
-   Copyright (C) 2011-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -49,18 +49,19 @@
 #define K_PageDown     (7)
 #define K_Home         (8)
 #define K_Insert       (9)
-#define K_Backtab     (10)
-#define K_Alt_R       (11)
-#define K_Alt_W       (12)
-#define K_Alt_H       (13)
-#define K_Alt_X       (14)
-#define K_Alt_B       (15)
-#define K_Enter       (16)
-#define K_Alt_E       (17)
-#define K_Alt_N       (18)
-#define K_Alt_D       (19)
-#define K_Alt_U       (20)
-#define K_Alt_F       (21)
+#define K_Delete      (10)
+#define K_Backtab     (11)
+#define K_Alt_R       (12)
+#define K_Alt_W       (13)
+#define K_Alt_H       (14)
+#define K_Alt_X       (15)
+#define K_Alt_B       (16)
+#define K_Enter       (17)
+#define K_Alt_E       (18)
+#define K_Alt_N       (19)
+#define K_Alt_D       (20)
+#define K_Alt_U       (21)
+#define K_Alt_F       (22)
 
 
 typedef struct {

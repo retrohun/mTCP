@@ -2,7 +2,7 @@
 /*
 
    mTCP Irc.H
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -39,8 +39,8 @@
 // RFC 2812 says ..
 //
 // IRCNICK_MAX_LEN (9+1)
-// IRCUSER_MAX_LEN
-// IRCREALNAME_MAX_LEN
+// IRCUSER_MAX_LEN is not specified
+// IRCREALNAME_MAX_LEN is not specified
 // IRCCHANNEL_MAX_LEN (50+1)
 // IRCHOSTNAME_MAX_LEN (63+1)
 //
@@ -49,11 +49,11 @@
 // We are not totally compliant, but I think 25 chars for nicks
 // and channels is more than enough.
 
-#define IRCNICK_MAX_LEN     (40)
-#define IRCUSER_MAX_LEN     (16)
-#define IRCREALNAME_MAX_LEN (40)
-#define IRCPASS_MAX_LEN     (50)
-#define IRCCHANNEL_MAX_LEN  (IRCNICK_MAX_LEN)
+#define IRCNICK_MAX_LEN     (50+1)
+#define IRCUSER_MAX_LEN     (50+1)
+#define IRCREALNAME_MAX_LEN (50+1)
+#define IRCPASS_MAX_LEN     (50+1)
+#define IRCCHANNEL_MAX_LEN  (50+1)
 #define IRCHOSTNAME_MAX_LEN (64)
 
 

@@ -1,8 +1,7 @@
-
 /*
 
    mTCP DnsTest.cpp
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,6 +26,7 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -42,8 +42,9 @@
 
 #include "types.h"
 
-#include "utils.h"
 #include "timer.h"
+#include "trace.h"
+#include "utils.h"
 #include "packet.h"
 #include "arp.h"
 #include "udp.h"
@@ -54,8 +55,6 @@
 #endif
 
 
-extern uint16_t _stklen = 16384l;
-
 
 void parseArgs( int argc, char *argv[] );
 void shutdown( int rc );
@@ -63,25 +62,14 @@ void shutdown( int rc );
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
 
-// Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-#ifdef __TURBOC__
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
-}
-#else
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
-#endif
 
 
 
@@ -104,7 +92,7 @@ char *DnsErrors[] = {
 
 
 
-static char CopyrightMsg1[] = "mTCP DNSTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2013\n";
+static char CopyrightMsg1[] = "mTCP DNSTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -123,7 +111,7 @@ int main( int argc, char *argv[] ) {
   }
 
   // No TCP sockets and no TCP Xmit buffers
-  if ( Utils::initStack( 0, 0 ) ) {
+  if ( Utils::initStack( 0, 0, ctrlBreakHandler, ctrlBreakHandler ) ) {
     fprintf( stderr, "\nFailed to initialize TCP/IP - exiting\n" );
     exit(-1);
   }
@@ -131,16 +119,6 @@ int main( int argc, char *argv[] ) {
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too, but do nothing.  We actually want Ctrl-C
-  // to be a legal character to send when in interactive mode.
-  setvect( 0x23, ctrlBreakHandler);
 
 
   printf( "Timeout set to %lu seconds, DNS Recursion = %s\n",
@@ -245,14 +223,8 @@ int main( int argc, char *argv[] ) {
 
 
 void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-
   if ( Verbose == 0 ) Utils::dumpStats( stderr );
-
-  fclose( TrcStream );
   exit( rc );
 }
 
@@ -299,7 +271,7 @@ void parseArgs( int argc, char *argv[] ) {
     }
     else if ( stricmp( argv[i], "-verbose" ) == 0 ) {
       Verbose = 1;
-      Utils::Debugging = Utils::Debugging | 0x41;
+      Trace_Debugging = Trace_Debugging | 0x41;
     }
     else if ( stricmp( argv[i], "-timeout" ) == 0 ) {
       i++;

@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Arp.H
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,30 +26,47 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2014-05-18: Add some static checks to the configuration options
 
 */
-
 
 
 #ifndef _ARP_HEADER_H
 #define _ARP_HEADER_H
 
-#include <dos.h>
-#include <time.h>
+
+
+// Load and check the configuration options first
 
 #include CFG_H
-
 #include "types.h"
-#include "timer.h"
-#include "Utils.h"
-#include "Packet.h"
+
+// Each entry in the ARP table is fairly modest - 14 bytes at the moment.
+// If you get ARP table thrashing with the maximums defined here then you
+// have a lot of hosts on your network segment.
+
+static_assert( ARP_MAX_ENTRIES >=  4 );
+static_assert( ARP_MAX_ENTRIES <= 32 );
+static_assert( ARP_MAX_PENDING >=  1 );
+static_assert( ARP_MAX_PENDING <=  8 );
+static_assert( ARP_MAX_PENDING <= ARP_MAX_ENTRIES );
+static_assert( ARP_RETRIES >= 1 );
+static_assert( ARP_RETRIES <= 5 );
+static_assert( ARP_TIMEOUT >=  100ul );
+static_assert( ARP_TIMEOUT <= 1000ul );
+
+
+
+// Continue with other includes
+
 #include "Eth.h"
 
 
 
 // General rules for ARP
 //
-// - If you get a request, add the requestor to your cache.
+// - If you get a request, add the requestor to your cache.  If they are
+//   looking for you they will probably talk to you soon.
 // - If you see somebody else get a reply, update your cache if needed
 //   but don't add a new entry.
 // - Drop a cache entry if it is older than 10 minutes.  (Not implemented yet)
@@ -60,9 +76,30 @@
 // don't expect to be running for years at a time.  Machines generally don't
 // change their MAC addresses unless something bad happens to them.
 //
-// Even worse, TCP will actively cache the ARP address of the next hop for
+// Even worse, mTCP will actively cache the ARP address of the next hop for
 // each socket to avoid having to constantly look up the next hop in the ARP
-// cache. :-)
+// cache. :-)  This is not standard behavior; it assumes that your network
+// topology is not changing.  There will be a new configuration option to
+// disable this optimization if it freaks you out.
+//
+//
+// Detecting IP address conflicts
+//
+// To detect an IP address conflict just ARP your own IP address and wait
+// for a response with a MAC address that is not yours.  If something winds
+// up in the cache then you know that something else is using your IP address.
+//
+// This code does two things to help that.  It lets you ARP your own IP address
+// and it will not respond to itself.  And if it gets an response back with
+// the correct MAC address it ignores it.  (A DHCP server that just gave you
+// an address might respond, and that is ok.)  But if something else responds,
+// it gets added to the table where presumably it will be found and reported
+// as an error.
+//
+// Right now, only Utils::initStack tries to detect address conflicts.
+// Use that code as a model if you need to detect conflicts too.
+
+
 
 
 class ArpHeader {
@@ -99,7 +136,7 @@ class Arp {
     } Pending_t;
 
     static Pending_t pending[ARP_MAX_PENDING];
-    static uint8_t   pendingEntries;
+    static uint16_t pendingEntries;
 
 
     // Our Arp cache
@@ -111,9 +148,9 @@ class Arp {
     } Rec_t;
 
     static Rec_t arpTable[ARP_MAX_ENTRIES];
-    static uint8_t entries;
+    static uint16_t entries;
 
-    static void updateEntry( uint8_t target, const EthAddr_t newEthAddr );
+    static void updateEntry( uint16_t target, const EthAddr_t newEthAddr );
     static void updateOrAddCache( EthAddr_t newEthAddr, IpAddr_t newIpAddr );
 
     static void sendArpRequest( IpAddr_t target_ip );
@@ -122,24 +159,39 @@ class Arp {
 
     static void driveArp2( void );
 
-    static int8_t findEth( const IpAddr_t target_ip, EthAddr_t *target );
-    static void   dumpTable( void );
+    static int8_t findEth( const IpAddr_t target_ip, EthAddr_t target );
     static void   deleteCacheEntry( int target );
+
 
   public:
 
     static void init( void );
 
     // Returns 0 if resolved, 1 is ARP is pending
-    static int8_t resolve( IpAddr_t target_ip, EthAddr_t *target_eth );
+    static int8_t resolve( IpAddr_t target_ip, EthAddr_t target_eth );
 
     // Called by Packet.CPP when you get an incoming ARP packet
-    static void processArp( const uint8_t *ah );
+    static void processArp( uint8_t *ah, uint16_t packetLen );
 
     // Called to drive pending ARP queries
     static inline void driveArp( void ) {
       if ( pendingEntries ) { driveArp2( ); }
     }
+
+    static void clearPendingTable( void );
+
+    #ifndef NOTRACE
+    static void dumpTable( void );
+    #endif
+
+    static void dumpStats( FILE *stream );
+
+    static uint32_t RequestsReceived;
+    static uint32_t RepliesReceived;
+    static uint32_t RequestsSent;
+    static uint32_t RepliesSent;
+    static uint32_t CacheModifiedCount;
+    static uint32_t CacheEvictions;
 
 };
 

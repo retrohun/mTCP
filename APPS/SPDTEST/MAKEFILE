@@ -1,5 +1,5 @@
 #
-# Netcat makefile
+# SpdTest makefile
 #
 #
 # Possible optimizations for 8088 class processors
@@ -21,6 +21,7 @@
 # -zpw  Use with above; make sure you are warning free!
 # -0    8088/8086 class code generation
 # -s    disable stack overflow checking
+# -zmf  put each function in a new code segment; helps with linking
 
 # -d1   Use for source level profiling
 
@@ -35,7 +36,7 @@ compile_options = -0 $(memory_model) -DCFG_H="spdtest.cfg" -oh -ok -ot -s -oa -e
 compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
 
-tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj
+tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj trace.obj
 objs = spdtest.obj
 
 all : clean spdtest.exe
@@ -46,7 +47,7 @@ clean : .symbolic
   @del *.map
 
 patch : .symbolic
-  ..\..\utils\patch spdtest.exe spdtest.map $(memory_model)
+  ..\..\utils\ptach spdtest.exe spdtest.map $(memory_model)
 
 .asm : $(tcp_c_dir)
 
@@ -61,4 +62,4 @@ patch : .symbolic
 
 spdtest.exe: $(tcpobjs) $(objs)
   #wlink system dos option map option stack=4096 debug watcom name $@ file *.obj
-  wlink system dos option map option stack=4096 name $@ file *.obj
+  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj

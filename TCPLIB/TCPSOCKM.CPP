@@ -2,7 +2,7 @@
 /*
 
    mTCP TcpSockM.cpp
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -53,8 +53,9 @@
 #endif
 #include <string.h>
 
-#include "Utils.h"
-#include "Timer.h"
+#include "timer.h"
+#include "trace.h"
+#include "utils.h"
 
 #include "tcp.h"
 #include "tcpsockm.h"
@@ -232,6 +233,8 @@ TcpSocket *TcpSocketMgr::accept( void ) {
 	socketTable[i]->pendingAccept = 0;
 	pendingAccepts--;
 
+        rc->lastActivity = TIMER_GET_CURRENT( );
+
 	TRACE_TCP(( "Tcp: (%08lx) Accepted new socket, pendingAccepts=%u\n",
 		    rc, pendingAccepts ));
 	break;
@@ -290,9 +293,23 @@ void TcpSocketMgr::makeInactive( TcpSocket *target ) {
     }
   }
 
+  /*
+     Faster, but does not preserve ordering.
+     Apparently ordering is important for web clients.
+
   if ( found ) {
     activeSockets--;
     socketTable[i] = socketTable[activeSockets];
+  }
+  */
+
+  // Slide the remaining sockets down to fill the hole.
+
+  if ( found ) {
+    activeSockets--;
+    for ( uint8_t j = i; j < getActiveSockets( ); j++ ) {
+      socketTable[j] = socketTable[j+1];
+    }
   }
 
 }

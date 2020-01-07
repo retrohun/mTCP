@@ -2,7 +2,7 @@
 /*
 
    mTCP Ircjr.h
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -50,54 +50,6 @@ extern void ERRBEEP( void );
 
 
 
-extern void fillUsingWord( void far * target, uint16_t fillWord, uint16_t len );
-#pragma aux fillUsingWord = \
-  "push es"    \
-  "push di"    \
-  "mov es, dx" \
-  "mov di, bx" \
-  "rep stosw"  \
-  "pop di"     \
-  "pop es"     \
-  modify [ax]  \
-  parm [dx bx] [ax] [cx]
-
-
-
-// This gotoxy is zero based!
-
-extern void gotoxy( unsigned char col, unsigned char row );
-#pragma aux gotoxy = \
-  "mov ah, 2h" \
-  "mov bh, 0h"  \
-  "int 10h" \
-  parm [dl] [dh] \
-  modify [ax bh dx];
-
-
-extern unsigned char wherex( void );
-#pragma aux wherex = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dl ];
-
-extern unsigned char wherey( void );
-#pragma aux wherey = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dh ];
-
-
-
-#endif
 
 #define normalizePtr( p, t ) {       \
   uint32_t seg = FP_SEG( p );        \
@@ -141,3 +93,8 @@ extern uint8_t ColorScheme;
 
 
 extern uint8_t mIRCtoCGAMap[];
+
+
+
+
+#endif

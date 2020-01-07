@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Netcat.cpp
-   Copyright (C) 2006-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,6 +26,7 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -123,8 +123,9 @@
 
 #include "types.h"
 
-#include "utils.h"
 #include "timer.h"
+#include "trace.h"
+#include "utils.h"
 #include "packet.h"
 #include "arp.h"
 #include "tcp.h"
@@ -132,9 +133,6 @@
 #include "udp.h"
 #include "dns.h"
 
-
-// Bump Turbo C++'s standard stack
-extern uint16_t _stklen = 16384l;
 
 
 // RECV_INTERFACE adds another layer of buffering, which is more
@@ -208,37 +206,22 @@ typedef struct {
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
+// Ctrl-Break and Ctrl-C handlers.
 
 // Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
 
 void __interrupt __far ctrlCHandler( ) {
-  // Do Nothing
-}
-#else
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
+  // Do Nothing - Ctrl-C is a legal character
 }
 
-void interrupt ctrlCHandler( ... ) {
-  // Do Nothing
-}
-#endif
 
 
-
-static char CopyrightMsg1[] = "mTCP Netcat by M Brutman (mbbrutman@gmail.com) (C)opyright 2007-2013\n";
+static char CopyrightMsg1[] = "mTCP Netcat by M Brutman (mbbrutman@gmail.com) (C)opyright 2007-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -267,7 +250,7 @@ int main( int argc, char *argv[] ) {
     exit(-1);
   }
 
-  if ( Utils::initStack( 2, TCP_SOCKET_RING_SIZE ) ) {
+  if ( Utils::initStack( 2, TCP_SOCKET_RING_SIZE, ctrlBreakHandler, ctrlCHandler ) ) {
     fprintf( stderr, "\nFailed to initialize TCP/IP - exiting\n" );
     exit(-1);
   }
@@ -275,15 +258,6 @@ int main( int argc, char *argv[] ) {
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too, but do nothing.  We actually want Ctrl-C
-  // to be a legal character to send when in interactive mode.
-  setvect( 0x23, ctrlCHandler);
 
 
 
@@ -1150,12 +1124,8 @@ static void parseEnv( void ) {
 
 
 static void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
   Utils::dumpStats( stderr );
-  fclose( TrcStream );
   exit( rc );
 }
 

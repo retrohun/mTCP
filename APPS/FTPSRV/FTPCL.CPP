@@ -2,7 +2,7 @@
 /*
 
    mTCP FtpCl.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -38,6 +38,7 @@
 
 #include "ftpcl.h"
 #include "ftpusr.h"
+#include "trace.h"
 
 FtpClient *FtpClient::activeClientsTable[ FTP_MAX_CLIENTS ];
 FtpClient *FtpClient::freeClientsTable[ FTP_MAX_CLIENTS ];
@@ -215,10 +216,9 @@ void FtpClient::startNewSession( TcpSocket *newSocket, uint32_t sessionId_p ) {
   // the admin specified a different addresses for PASV responses, set that
   // up.
 
-  uint32_t clientIpAddr = ((uint32_t)cs->dstHost[0] << 24) | ((uint32_t)cs->dstHost[1] << 16) |
-                          ((uint32_t)cs->dstHost[2] <<  8) | ((uint32_t)cs->dstHost[3]);
+  uint32_t clientIpAddr_u = *(uint32_t *)(&cs->dstHost);
 
-  if ( (MyIpAddr_u & Netmask_u) == (clientIpAddr & Netmask_u) ) {
+  if ( (MyIpAddr_u & Netmask_u) == (clientIpAddr_u & Netmask_u) ) {
     isLocalSubnet = 1;
     Ip::copy(pasvAddr, MyIpAddr);
   }

@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Dns.H
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,26 +26,47 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2014-05-19: Add some static checks to the configuration options
 
 */
-
 
 
 #ifndef _DNS_HEADER_H
 #define _DNS_HEADER_H
 
 
-#ifdef COMPILE_DNS
 
-#include <dos.h>
-#include <time.h>
+// Load and check the configuration options first
 
 #include CFG_H
-
 #include "types.h"
-#include "Utils.h"
-#include "Packet.h"
-#include "Eth.h"
+
+static_assert( DNS_MAX_NAME_LEN >=  64 );
+static_assert( DNS_MAX_NAME_LEN <= 192 );
+static_assert( DNS_MAX_ENTRIES  >=   1 );
+static_assert( DNS_MAX_ENTRIES  <= 127 );  // Only 7 bits ...
+static_assert( DNS_HANDLER_PORT !=   0 );
+static_assert( DNS_INITIAL_SEND_TIMEOUT >=   100ul );
+static_assert( DNS_INITIAL_SEND_TIMEOUT <=  2000ul );
+static_assert( DNS_RETRY_THRESHOLD      >=   500ul );
+static_assert( DNS_RETRY_THRESHOLD      <=  4000ul );
+
+#ifndef DNS_RECURSION_DESIRED_IS_VAR
+static_assert( (DNS_RECURSION_DESIRED == 0) || (DNS_RECURSION_DESIRED == 1) );
+#endif
+
+#ifndef DNS_TIMEOUT_IS_VAR
+static_assert( DNS_TIMEOUT              >=  5000ul );
+static_assert( DNS_TIMEOUT              <= 20000ul );
+#endif
+
+
+
+// Continue with other includes
+
+#include <time.h>
+
+#include "udp.h"
 
 
 
@@ -171,5 +191,4 @@ class Dns {
 };
 
 
-#endif
 #endif

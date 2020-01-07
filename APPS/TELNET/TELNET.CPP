@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Telnet.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -39,7 +38,18 @@
                Fix CR/LF handling once and for all (Add CR/NUL)
    2012-03-14: Add scroll region support; add addition non-CSI
                ESC commands.  Restructure and cleanup
-
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
+   2015-01-22: Add 132 column support
+   2015-01-23: Bug fix; do a proper close and wait for all input
+               to come in before exiting the main loop.  Shorten
+               TCP close timeout; rewrite help text code to cut
+               down on code bloat.
+   2017-01-20: Bug fixes; When sending bytes make sure that data
+               just don't get dropped because we ran out of outgoing
+               packets.
+   2018-10-27: Add code to eliminate CGA snow.  Add a CGA_MONO
+               color scheme.
+   2019-11-20: Terminal emulation bug fixes.
 
    Todo:
 
@@ -60,8 +70,12 @@
 #include <string.h>
 #include <time.h>
 
+#include CFG_H
+
 #include "types.h"
 
+#include "timer.h"
+#include "trace.h"
 #include "utils.h"
 #include "packet.h"
 #include "arp.h"
@@ -109,9 +123,9 @@ UserInputMode_t::e UserInputMode = UserInputMode_t::Telnet;
 
 // Globals: Toggles and options
 
-uint8_t DebugTelnet = 0;       // Are we spitting out messages for telnet?
-uint8_t DebugAnsi = 0;         // Are we spitting out messages for ANSI codes?
-uint8_t RawOrTelnet = 1;       // Are we doing telnet or just raw?
+bool    DebugTelnet = false;   // Are we spitting out messages for telnet?
+bool    DebugAnsi = false;     // Are we spitting out messages for ANSI codes?
+bool    RawOrTelnet = true;    // Are we doing telnet or just raw?
 uint8_t InitWrapMode = 1;      // Normally we wrap
 uint8_t SendBsAsDel  = 1;
 uint8_t LocalEcho    = 0;      // Is local echoing enabled?
@@ -126,50 +140,44 @@ char TermType[TERMTYPE_MAXLEN] = "ANSI";
 
 
 
-// Socket processing functions
 
 static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len );
 
 static uint16_t processCSISeq( uint8_t *buffer, uint16_t len );
-static void     processAnsiCommand( uint8_t commandLetter );
+inline void     processAnsiCommand( uint8_t commandLetter );
 static void     processDecPrivateControl( uint8_t commandLetter );
-static uint16_t processNonCSIEscSeq( uint8_t *buffer );
+static void     processNonCSIEscSeq( uint8_t ch );
 
        int16_t  processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize );
 static int16_t  processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBufLen, uint8_t *outputBuf, uint16_t *outputBufLen );
 
-static uint8_t processUserInput_TelnetLocal( Key_t key );
-static void    processUserInput_TelnetNonLocal( Key_t key );
+static uint8_t  processUserInput_TelnetLocal( Key_t key );
+static void     processUserInput_TelnetNonLocal( Key_t key );
 
-static void parseArgs( int argc, char *argv[] );
-static void getCfgOpts( void );
+static void     parseArgs( int argc, char *argv[] );
+static void     getCfgOpts( void );
 
-static void resolveAndConnect( void );
-static void sendInitialTelnetOpts( void );
-static void shutdown( int rc );
+static void     resolveAndConnect( void );
+static void     sendInitialTelnetOpts( void );
+static void     shutdown( int rc );
 
-static void doHelp( void );
+static void     doHelp( void );
 
-
-
-
+static void     send( uint8_t *userBuf, uint16_t userBufLen );
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
+// Ctrl-Break and Ctrl-C handlers.
 
 // Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
 
 void __interrupt __far ctrlCHandler( ) {
-  // Do Nothing
+  // Do Nothing - Ctrl-C is a legal character
 }
 
 
@@ -220,23 +228,25 @@ StreamStates StreamState;
 enum CsiParseState_t { LookForPrivateControl, NoParmsFound, ParmsFound };
 CsiParseState_t csiParseState;
 
-int16_t parms[ CSI_ARGS ];  // Array of parameters
-uint8_t parmsFound;         // Number of parameters found
-bool    decPrivateControl;  // Is this a private control sequence?
+int16_t  parms[ CSI_ARGS ];  // Array of parameters
+uint16_t parmsFound;         // Number of parameters found
+bool     decPrivateControl;  // Is this a private control sequence?
 
-char    traceBuffer[60];    // ANSI debug trace buffer
-uint8_t traceBufferLen;
+char     traceBuffer[60];    // ANSI debug trace buffer
+uint16_t traceBufferLen;
 
 uint8_t fg=7;
 uint8_t bg=0;
 uint8_t bold=0;
 uint8_t blink=0;
-uint8_t underline=0;
+bool    underline=false;
 uint8_t reverse=0;
 
 int16_t saved_cursor_x = 0, saved_cursor_y = 0;
 
 
+
+uint8_t ColorScheme = 0;  // 0 default, 1 = CGA_MONO
 
 uint8_t *fgColorMap;
 uint8_t *bgColorMap;
@@ -312,7 +322,7 @@ static char tmpBuf[160];
 
 
 
-static char CopyrightMsg1[] = "mTCP Telnet by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2013\r\n";
+static char CopyrightMsg1[] = "mTCP Telnet by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2020\r\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\r\n\r\n";
 
 int main( int argc, char *argv[] ) {
@@ -330,23 +340,13 @@ int main( int argc, char *argv[] ) {
   getCfgOpts( );
 
 
-  if ( Utils::initStack( 1, TCP_SOCKET_RING_SIZE ) ) {
+  if ( Utils::initStack( 1, TCP_SOCKET_RING_SIZE, ctrlBreakHandler, ctrlCHandler ) ) {
     printf( "\nFailed to initialize TCP/IP - exiting\n" );
     exit(-1);
   }
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too, but do nothing.  We actually want Ctrl-C
-  // to be a legal character to send when in interactive mode.
-  setvect( 0x23, ctrlCHandler);
 
 
 
@@ -371,27 +371,38 @@ int main( int argc, char *argv[] ) {
 
 
 
-  if ( s.colorCard == 0 ) {
-    fgColorMap = fgColorMap_Mono;
-    bgColorMap = bgColorMap_Mono;
-  }
-  else {
+  if ( s.isColorCard( ) && (ColorScheme ==0) ) {
     fgColorMap = fgColorMap_CGA;
     bgColorMap = bgColorMap_CGA;
+  }
+  else {
+    fgColorMap = fgColorMap_Mono;
+    bgColorMap = bgColorMap_Mono;
   }
 
 
 
   // Set color palette up
-  if ( s.colorCard ) {
-    scNormal       = 0x07; // White on black
-    scBright       = 0x0F; // Bright White on black
-    scTitle        = 0x1F; // Bright White on blue
-    scBorder       = 0x0C; // Bright Red on black
-    scCommandKey   = 0x09; // Bright Blue on black
-    scToggleStatus = 0x0E; // Yellow on black
-    scFileXfer     = 0x1F; // Bright White on blue
-    scErr          = 0x4F; // Red on blue
+  if ( s.isColorCard( ) ) {
+    if ( ColorScheme == 0 ) {
+      scNormal       = 0x07; // White on black
+      scBright       = 0x0F; // Bright White on black
+      scTitle        = 0x1F; // Bright White on blue
+      scBorder       = 0x0C; // Bright Red on black
+      scCommandKey   = 0x09; // Bright Blue on black
+      scToggleStatus = 0x0E; // Yellow on black
+      scFileXfer     = 0x1F; // Bright White on blue
+      scErr          = 0x4F; // Red on blue
+    } else {
+      scNormal       = 0x07; // Normal
+      scBright       = 0x0F; // Bright
+      scTitle        = 0x0F; // Bright
+      scBorder       = 0x0F; // Bright
+      scCommandKey   = 0x70; // Reverse
+      scToggleStatus = 0x0F; // Bright
+      scFileXfer     = 0x0F; // Bright
+      scErr          = 0x70; // Reverse
+    }
   }
   else {
     scNormal       = 0x02; // Normal
@@ -414,7 +425,6 @@ int main( int argc, char *argv[] ) {
   s.add( CopyrightMsg2 );
   s.curAttr = scNormal;
 
-
   resolveAndConnect( );
 
   s.add ( "Remember to use " );
@@ -422,7 +432,7 @@ int main( int argc, char *argv[] ) {
   s.add( " for help!\r\n\r\n" );
 
 
-  sprintf( tmpBuf, "Connected to %s (%d.%d.%d.%d) on port %d\r\n\r\n",
+  sprintf( tmpBuf, "Connected to %s (%d.%d.%d.%d) on port %u\r\n\r\n",
 	   serverAddrName, serverAddr[0], serverAddr[1],
 	   serverAddr[2], serverAddr[3], serverPort );
   s.add( tmpBuf );
@@ -431,17 +441,22 @@ int main( int argc, char *argv[] ) {
   sendInitialTelnetOpts( );
 
 
+  // done is more than a simple flag:
+  //
+  //   0 - everything is fine
+  //   1 - we want to close or the other side has initiated a close
+  //   2 - we started a close
+  //   3 - the close is complete, it timed out, or the user is impatient.
+  
   uint8_t done = 0;
-  uint8_t remoteDone = 0;
 
   uint16_t bytesToRead = RECV_BUF_SIZE;
   uint16_t bytesInBuffer = 0;
 
-  while ( !done && !remoteDone ) {
+  while ( done != 3 ) {
 
     if ( CtrlBreakDetected ) {
-      done = 1;
-      break;
+      if ( done == 0 ) done = 1; else done = 3;
     }
 
     PACKET_PROCESS_SINGLE;
@@ -450,45 +465,27 @@ int main( int argc, char *argv[] ) {
 
 
     // Process incoming packets first.
+    //
+    // Loop and read from the socket and process what we receive until there
+    // is no more to receive.
 
-    if ( remoteDone == 0 ) {
+    // Make sure that we break out to process user input once in a while.
+    uint16_t packetsProcessed = 10;
 
-      while ( 1 ) {
+    while ( packetsProcessed ) {
 
-	int16_t recvRc = mySocket->recv( recvBuffer+bytesInBuffer, bytesToRead-bytesInBuffer );
+      int16_t recvRc = mySocket->recv( recvBuffer+bytesInBuffer, bytesToRead-bytesInBuffer );
 
-	PACKET_PROCESS_SINGLE;
-	Arp::driveArp( );
-	Tcp::drivePackets( );
+      PACKET_PROCESS_SINGLE;
+      Arp::driveArp( );
+      Tcp::drivePackets( );
 
-	if ( recvRc > 0 ) {
+      if ( recvRc > 0 ) {
 
-	  bytesInBuffer += recvRc;
+        packetsProcessed--;
 
-          if ( SocketInputMode == SocketInputMode_t::Telnet ) {
-            bytesInBuffer = processSocket( recvBuffer, bytesInBuffer );
-          }
-          #ifdef FILEXFER
-          else if ( SocketInputMode == SocketInputMode_t::Download ) {
-            bytesInBuffer = processSocket_Download( recvBuffer, bytesInBuffer );
-          }
-          else if ( SocketInputMode == SocketInputMode_t::Upload ) {
-            bytesInBuffer = processSocket_Upload( recvBuffer, bytesInBuffer );
-          }
-          #endif
-	}
-	else {
-	  break;
-	}
+        bytesInBuffer += recvRc;
 
-      } // end while
-
-
-      // We might have had bytes to process even though we have not received new
-      // data.  Take care of them.  (This only should happen if we are processing
-      // telnet options and we use up too many outgoing buffers with small payloads.)
-
-      if ( bytesInBuffer ) {
         if ( SocketInputMode == SocketInputMode_t::Telnet ) {
           bytesInBuffer = processSocket( recvBuffer, bytesInBuffer );
         }
@@ -500,10 +497,34 @@ int main( int argc, char *argv[] ) {
           bytesInBuffer = processSocket_Upload( recvBuffer, bytesInBuffer );
         }
         #endif
+
+      } else {
+        break;
       }
 
-      remoteDone = mySocket->isRemoteClosed( );
+    } // end while
+
+
+    // We might have had bytes to process even though we have not received new
+    // data.  Take care of them.  (This only should happen if we are processing
+    // telnet options and we use up too many outgoing buffers with small payloads.)
+
+    if ( bytesInBuffer ) {
+      if ( SocketInputMode == SocketInputMode_t::Telnet ) {
+        bytesInBuffer = processSocket( recvBuffer, bytesInBuffer );
+      }
+      #ifdef FILEXFER
+      else if ( SocketInputMode == SocketInputMode_t::Download ) {
+        bytesInBuffer = processSocket_Download( recvBuffer, bytesInBuffer );
+      }
+      else if ( SocketInputMode == SocketInputMode_t::Upload ) {
+        bytesInBuffer = processSocket_Upload( recvBuffer, bytesInBuffer );
+      }
+      #endif
     }
+
+    // If the other side closed on us start closing down our side.
+    if ( mySocket->isRemoteClosed( ) && (done == 0) ) done = 1;
 
 
     #ifdef FILEXFER
@@ -527,7 +548,7 @@ int main( int argc, char *argv[] ) {
     #endif
 
 
-    if ( s.virtualUpdated && UserInputMode == UserInputMode_t::Telnet ) {
+    if ( s.isVirtualScreenUpdated( ) && UserInputMode == UserInputMode_t::Telnet ) {
       s.paint( );
       s.updateVidBufPtr( );
     }
@@ -546,10 +567,14 @@ int main( int argc, char *argv[] ) {
         switch ( UserInputMode ) {
 
           case UserInputMode_t::Telnet:
-            if ( key.local )
-              done = processUserInput_TelnetLocal( key );
-            else
+            if ( key.local ) {
+              // Returns 1 if the user wants to quit.
+              if ( processUserInput_TelnetLocal( key ) ) {
+                if ( done == 0 ) done = 1; else done = 3;
+              }
+            } else {
               processUserInput_TelnetNonLocal( key );
+            }
             break;
 
           case UserInputMode_t::Help:
@@ -587,18 +612,28 @@ int main( int argc, char *argv[] ) {
 
     } // end if keyboard pressed
 
+
+    // The other side closed or the user requested an exit.  We want to do a
+    // controlled close of the socket while processing any remaining incoming
+    // data.  But there has to be a reasonable timeout period.
+
+    if ( done ) {
+      if ( done == 1 ) {
+        mySocket->closeNonblocking( );
+        done = 2;
+      }
+      else {
+        if ( mySocket->isCloseDone( ) ) {
+          done = 3;
+        }
+      }
+    }
+
   }
 
 
-
-  s.paint( );
-  s.updateVidBufPtr( );
-
   s.curAttr = 0x07;
-
-  s.add( "\r\nConnection closing\r\n" );
-
-  mySocket->close( );
+  s.add( "\r\nConnection closed - have a great day!\r\n" );
 
   TcpSocketMgr::freeSocket( mySocket );
 
@@ -608,8 +643,51 @@ int main( int argc, char *argv[] ) {
 }
 
 
+// This version of send is safe in that it checks the return code from the
+// real socket send and loops if necessary to make sure the packet gets out.
+//
+// If the socket is dead at the time of this call nothing will happen.
+// We don't bother passing a return code back; the other loops in the program
+// will detect the dead socket soon enough.
+
+void send( uint8_t *userBuf, uint16_t userBufLen ) {
+
+  uint16_t bytesSent = 0;
+
+  while ( bytesSent < userBufLen ) {
+
+    int16_t rc = mySocket->send( userBuf+bytesSent, userBufLen-bytesSent );
+
+    if ( rc < 0 ) break;
+
+    bytesSent += rc;
+
+    if ( rc == 0 ) {
+
+      // We had data to send but none was sent; we must be backlogged.  Try
+      // to process some packets.
+
+      PACKET_PROCESS_SINGLE;
+      Arp::driveArp( );
+      Tcp::drivePackets( );
+    }
+
+  } // end while
+
+  // Drive packets out at the end to speed things up.
+  PACKET_PROCESS_SINGLE;
+  Arp::driveArp( );
+  Tcp::drivePackets( );
+}
 
 
+static void toggleOnSound( void ) {
+  sound(500); delay(50); sound(750); delay(50); nosound( );
+}
+
+static void toggleOffSound( void ) {
+  sound(500); delay(50); nosound( );
+}
 
 uint8_t processUserInput_TelnetLocal( Key_t key ) {
 
@@ -624,35 +702,35 @@ uint8_t processUserInput_TelnetLocal( Key_t key ) {
     s.paint( );
   }
   else if ( key.specialKey == K_Alt_W ) {
-    s.wrapMode = !s.wrapMode;
-    if ( s.wrapMode ) {
-      sound(500); delay(50); sound(750); delay(50); nosound( );
+    s.toggleWrapMode( );
+    if ( s.isWrapModeOn( ) ) {
+      toggleOnSound( );
     }
     else {
-      sound(500); delay(50); nosound( );
+      toggleOffSound( );
     }
   }
   else if ( key.specialKey == K_Alt_E ) {
     LocalEcho = !LocalEcho;
     if ( LocalEcho ) {
-      sound(500); delay(50); sound(750); delay(50); nosound( );
+      toggleOnSound( );
     }
     else {
-      sound(500); delay(50); nosound( );
+      toggleOffSound( );
     }
   }
   else if ( key.specialKey == K_Alt_N ) {
     NewLineMode++;
     if ( NewLineMode == 5 ) NewLineMode = 0;
-    sound(500); delay(50); sound(750); delay(50); nosound( );
+    toggleOnSound( );
   }
   else if ( key.specialKey == K_Alt_B ) {
     SendBsAsDel = !SendBsAsDel;
     if ( SendBsAsDel ) {
-      sound(500); delay(50); sound(750); delay(50); nosound( );
+      toggleOnSound( );
     }
     else {
-      sound(500); delay(50); nosound( );
+      toggleOffSound( );
     }
   }
   else if ( key.specialKey == K_Alt_H ) {
@@ -665,20 +743,20 @@ uint8_t processUserInput_TelnetLocal( Key_t key ) {
   else if ( key.specialKey == K_Alt_D ) {
     drawProtocolMenu( );
     UserInputMode  = UserInputMode_t::ProtocolSelect_Download;
-    s.updateRealScreen = 0;
+    s.doNotUpdateRealScreen( );
   }
   else if ( key.specialKey == K_Alt_U ) {
     drawProtocolMenu( );
     UserInputMode  = UserInputMode_t::ProtocolSelect_Upload;
-    s.updateRealScreen = 0;
+    s.doNotUpdateRealScreen( );
     // This space for rent.
   }
   else if ( key.specialKey == K_Alt_F ) {
     s.clearConsole( );
-    s.myCprintf( 0, 0, scTitle, "mTCP Telnet DOS Shell\r\n\r\n" );
-    s.myCprintf( scErr, "Warning! TCP/IP packets are not being processed.  Do not take too long or your\r\n" );
-    s.myCprintf( scErr, "connection may be dropped!\r\n\r\n" );
-    s.myCprintf( scNormal, "Use the \"exit\" command to return.\r\n\r\n" );
+    s.myCprintf( 0, 0, scTitle, "mTCP Telnet DOS Shell" );
+    s.myCprintf( 0, 2, scErr, "Warning! TCP/IP packets are not being processed.  Do not take too long or your" );
+    s.myCprintf( 0, 3, scErr, "connection may be dropped!" );
+    s.myCprintf( 0, 5, scNormal, "Use the \"exit\" command to return.\r\n\r\n" );
     system( "command" );
     s.paint( );
   }
@@ -689,14 +767,29 @@ uint8_t processUserInput_TelnetLocal( Key_t key ) {
 
 
 
+// This code uses a primitive method to send data through a socket; instead of
+// calling the higher level send call which does memory copies, it grabs an
+// outgoing transmission buffer directly and fills in the payload.  This cuts
+// down on memcpy calls and overhead.
+//
+// It's gross but it performs better.  Everywhere else uses send and deals with
+// the overhead because it is easier and those paths are not performance
+// sensitive at all.
+
 void processUserInput_TelnetNonLocal( Key_t key ) {
 
-  DataBuf *buf = (DataBuf *)TcpBuffer::getXmitBuf( );
+  // Do a quick pre-check to make sure that we have room in the outgoing packet
+  // queue to send something.  Otherwise, there is no point in reading the
+  // keyboard.
 
-  if ( buf == NULL ) {
-    // Can't get a buf to transmit with - might want to do an error beep here
-    return;
-  }
+  if ( mySocket->outgoingQueueIsFull( ) ) return;
+
+
+  // In theory we can send a packet if we need to.  Now get a packet ...  and
+  // if we can't, exit early for the same reason.
+
+  DataBuf *buf = (DataBuf *)TcpBuffer::getXmitBuf( );
+  if ( buf == NULL ) return;
 
 
   buf->b.dataLen = 0;
@@ -806,6 +899,22 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
       break;
     }
 
+    case K_Delete: {
+
+      // Linux doesn't have a key mapping for DEL in the ansi terminal
+      // type.  You might want to send the xterm key mapping (shown in the
+      // comment) but this doesn't work universally.  So just send a del
+      // character now, which is the correct safe choice.  (Previously
+      // it was a dead key, so this is a slight improvement.
+
+      //buf->b.dataLen = 4;
+      //buf->data[0] = 0x1b; buf->data[1] = '['; buf->data[2] = '3'; buf->data[3] = '~';
+
+      buf->b.dataLen = 1;
+      buf->data[0] = 127;
+      break;
+    }
+
   } // end switch
 
   if ( LocalEcho ) {
@@ -821,9 +930,20 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
   }
 
   if ( buf->b.dataLen ) {
-    // Fixme: check return code.  Need to recycle this buffer if it
-    // was not accepted.
-    mySocket->enqueue( &buf->b );
+
+    // Send the packet.  We know we had room in the socket outgoing queue so
+    // this only fails if the socket is dead.
+
+    if ( mySocket->enqueue( &buf->b ) != 0 ) {
+
+      // Put the transmit buffer back in the pool.  The user input is lost
+      // but we're not going to be running long anyway given that the socket
+      // is probably closed.
+
+      TcpBuffer::returnXmitBuf( (TcpBuffer *)buf );
+
+    }
+
   }
 
 }
@@ -831,41 +951,50 @@ void processUserInput_TelnetNonLocal( Key_t key ) {
 
 
 
-  
+
+void errorResolvingServer( void ) {
+  s.add( "Error resolving server: " );
+  s.add( serverAddrName );
+  s.add( "\r\n" );
+  shutdown( -1 );
+}
 
 
+void checkForUserExit( void ) {
+
+  if ( bioskey(1) ) {
+    char c = getch( );
+    if ( c == 3 || c == 27 ) {
+      s.add( "[Ctrl-C] or [Esc] pressed - quitting.\r\n" );
+      shutdown( -1 );
+    }
+  }
+
+  if ( CtrlBreakDetected ) {
+    s.add( "[Ctrl-Break] pressed - quitting.\r\n" );
+    shutdown( -1 );
+  }
+
+}
+
+
+// Only return from here if we connected.  If there is a failure this
+// function will just end the program.
 
 void resolveAndConnect( void ) {
 
   s.add( "Resolving server address - press [ESC] to abort\r\n\r\n" );
 
-
   int8_t rc;
 
-  // Resolve the name and definitely send the request
-  int8_t rc2 = Dns::resolve( serverAddrName, serverAddr, 1 );
-  if ( rc2 < 0 ) {
-    s.add( "Error resolving server: " );
-    s.add( serverAddrName );
-    s.add( "\r\n" );
-    shutdown( -1 );
-  }
+  // Resolve the name and force it to send the request for the first time.
 
-  uint8_t done = 0;
+  rc = Dns::resolve( serverAddrName, serverAddr, 1 );
+  if ( rc < 0 ) errorResolvingServer( );
 
-  while ( !done ) {
+  while ( 1 ) {
 
-    if ( CtrlBreakDetected ) {
-      break;
-    }
-
-    if ( kbhit( ) ) {
-      char c = getch( );
-      if ( c == 27 ) {
-        s.add( "[Esc] pressed - quitting.\r\n" );
-        shutdown( -1 );
-      }
-    }
+    checkForUserExit( );
 
     if ( !Dns::isQueryPending( ) ) break;
 
@@ -877,14 +1006,9 @@ void resolveAndConnect( void ) {
   }
 
   // Query is no longer pending or we bailed out of the loop.
-  rc2 = Dns::resolve( serverAddrName, serverAddr, 0 );
+  rc = Dns::resolve( serverAddrName, serverAddr, 0 );
 
-  if ( rc2 != 0 ) {
-    s.add( "Error resolving server: " );
-    s.add( serverAddrName );
-    s.add( "\r\n" );
-    shutdown( -1 );
-  }
+  if ( rc != 0 ) errorResolvingServer( );
 
   sprintf( tmpBuf, "Server %s resolved to %d.%d.%d.%d\r\nConnecting to port %u...\r\n\r\n",
            serverAddrName, serverAddr[0], serverAddr[1],
@@ -913,23 +1037,11 @@ void resolveAndConnect( void ) {
       Tcp::drivePackets( );
       Arp::driveArp( );
 
-      if ( mySocket->isConnectComplete( ) ) { break; }
+      if ( mySocket->isConnectComplete( ) ) return;
 
-      if ( bioskey(1) ) {
-        char c = getch( );
-        if ( c == 3 || c == 27 ) {
-          s.add( "[Ctrl-C] or [Esc] pressed - quitting.\r\n" );
-          shutdown( -1 );
-        }
-      }
-
-      if ( CtrlBreakDetected ) {
-        s.add( "[Ctrl-Break] pressed - quitting.\r\n" );
-          shutdown( -1 );
-      }
+      checkForUserExit( );
 
       if ( mySocket->isClosed( ) || (Timer_diff( start, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS( ConnectTimeout )) ) {
-        rc = -1;
         break;
       }
 
@@ -940,10 +1052,9 @@ void resolveAndConnect( void ) {
 
   }
 
-  if ( rc != 0 ) {
-    s.add( "Socket connection failed\r\n" );
-    shutdown( -1 );
-  }
+
+  s.add( "Socket connection failed\r\n" );
+  shutdown( -1 );
 
 }
 
@@ -966,7 +1077,7 @@ void sendInitialTelnetOpts( void ) {
 
 
   // Send initial Telnet options
-  if ( RawOrTelnet == 1 ) {
+  if ( RawOrTelnet ) {
 
     MyTelnetOpts.setDoOrDontPending( TELOPT_ECHO );
     MyTelnetOpts.setDoOrDontPending( TELOPT_SGA );
@@ -979,7 +1090,7 @@ void sendInitialTelnetOpts( void ) {
     //                   TEL_IAC, TELCMD_DO, TELOPT_BIN,
     //                   TEL_IAC, TELCMD_WILL, TELOPT_BIN };
 
-    mySocket->send( output, sizeof(output) );
+    send( output, sizeof(output) );
     Tcp::drivePackets( );
   }
 
@@ -989,7 +1100,7 @@ void sendInitialTelnetOpts( void ) {
 
 void setTelnetBinaryMode( bool binaryMode ) {
 
-  if ( RawOrTelnet == 0 ) return;
+  if ( !RawOrTelnet ) return;
 
 
   // We always try to turn it on/off for both directions at the same time.
@@ -1019,87 +1130,110 @@ void setTelnetBinaryMode( bool binaryMode ) {
     output[4] = TELCMD_WONT;
   }
 
-  mySocket->send( output, 6 );
+  send( output, 6 );
   Tcp::drivePackets( );
 }
 
 
 
 
+typedef _Packed struct {
+  uint8_t x;
+  uint8_t y;
+  uint8_t *attr;
+  char *string;
+} HelpMenu_t;
+
+HelpMenu_t HelpMenu[] = {
+  { 0,  2, &scTitle,      CopyrightMsg1},
+  { 2,  3, &scTitle,      CopyrightMsg2},
+  { 0,  5, &scNormal,     "Commands:"},
+  {10,  5, &scCommandKey, "Alt-H" },
+  {16,  5, &scNormal,     "Help" },
+  {27,  5, &scCommandKey, "Alt-R" },
+  {33,  5, &scNormal,     "Refresh" },
+  {44,  5, &scCommandKey, "Alt-X" },
+  {50,  5, &scNormal,     "Exit" },
+#ifdef FILEXFER
+  {10,  6, &scCommandKey, "Alt-D" },
+  {16,  6, &scNormal,     "Download" },
+  {27,  6, &scCommandKey, "Alt-U" },
+  {33,  6, &scNormal,     "Upload" },
+  {44,  6, &scCommandKey, "Alt-F" },
+  {50,  6, &scNormal,     "DOS Shell" },
+#else
+  {10,  6, &scCommandKey, "Alt-F" },
+  {16,  6, &scNormal,     "DOS Shell" },
+#endif
+  { 0,  7, &scNormal,     "Toggles:" },
+  {10,  7, &scCommandKey, "Alt-E" },
+  {16,  7, &scNormal,     "Local Echo On/Off" },
+  {36,  7, &scCommandKey, "Alt-W" },
+  {42,  7, &scNormal,     "Wrap at right margin On/Off" },
+  {10,  8, &scCommandKey, "Alt-B" },
+  {16,  8, &scNormal,     "Send Backspace as Delete On/Off" },
+  {10,  9, &scCommandKey, "Alt-N" },
+  {16,  9, &scNormal,     "Send [Enter] as CR/NUL, CR/LF, CR or LF" },
+  { 0, 11, &scNormal,     "Virtual buffer pages:    Echo:       Wrap:      Term type:" },
+  { 0, 12, &scNormal,     "Send Backspace As Delete:      Send [Enter] as:"},
+  { 0, 17, &scBright,     "Press a key to go back to your session ..." },
+  {99,  0, 0, ""}
+};
+
+char *NewLineModes[] = {
+  "CR/LF",
+  "CR",
+  "LF",
+  "CR/NUL",
+  "AUTO"
+};
+
 void doHelp( void ) {
 
-  s.updateRealScreen = 0;
+  s.doNotUpdateRealScreen( );
 
   UserInputMode = UserInputMode_t::Help;
 
-  uint8_t i;
-
-  #ifdef __TURBOC__
-  textattr( scNormal );
-
-  for ( i=1; i<18; i++ ) {
-    gotoxy( 0, i );
-    clreol( );
-  }
-  #else
-  uint16_t *start = (uint16_t far *)(s.Screen_base + 2*80);
-  fillUsingWord( start, (scNormal<<8|32), 17*80 );
-  #endif
-
-
-  s.repeatCh( 0, 1, scBorder, 205, 80 );
-
-  gotoxy( 0, 2 );
-  s.myCprintf( scTitle, "%s", CopyrightMsg1 );
-  s.myCprintf( scNormal, "  " );
-  s.myCprintf( scTitle, "%s", CopyrightMsg2 );
-
-
-  s.myCprintf( scNormal, "Commands: " ); s.myCprintf( scCommandKey, "Alt-H" ); s.myCprintf( scNormal, " Help       " ); s.myCprintf( scCommandKey, "Alt-R" ); s.myCprintf( scNormal, " Refresh    " ); s.myCprintf( scCommandKey, "Alt-X" ); s.myCprintf( scNormal, " Exit\r\n" );
-  s.myCprintf( scNormal, "          " ); s.myCprintf( scCommandKey, "Alt-D" ); s.myCprintf( scNormal, " Download   " ); s.myCprintf( scCommandKey, "Alt-U" ); s.myCprintf( scNormal, " Upload     " ); s.myCprintf( scCommandKey, "Alt-F" ); s.myCprintf( scNormal, " DOS Shell\r\n" );
-
-  s.myCprintf( scNormal, "Toggles:  " ); s.myCprintf( scCommandKey, "Alt-E" ); s.myCprintf( scNormal, " Local Echo On/Off   " );
-  s.myCprintf( scCommandKey, "Alt-W" ); s.myCprintf( scNormal, " Wrap at right margin On/Off\r\n" );
-  s.myCprintf( scNormal, "          " ); s.myCprintf( scCommandKey, "Alt-B" ); s.myCprintf( scNormal, " Send Backspace as Delete On/Off\r\n" );
-  s.myCprintf( scNormal, "          " ); s.myCprintf( scCommandKey, "Alt-N" ); s.myCprintf( scNormal, " Send [Enter] as CR/NUL, CR/LF, CR or LF\r\n\r\n" );
-
-  s.myCprintf( scNormal, "Term Type: " ); s.myCprintf( scToggleStatus, "%s", TermType );
-  s.myCprintf( scNormal, "   Virtual buffer pages: " ); s.myCprintf( scToggleStatus, "%d  ", BackScrollPages );
-  s.myCprintf( scNormal, "Echo: " ); s.myCprintf( scToggleStatus, "%s", (LocalEcho?"On":"Off") );
-  s.myCprintf( scNormal, "   Wrap: " ); s.myCprintf( scToggleStatus, "%s\r\n", (s.wrapMode?"On":"Off") );
-  s.myCprintf( scNormal, "Send Backspace as Delete: " ); s.myCprintf( scToggleStatus, "%s", (SendBsAsDel?"On":"Off") );
-  s.myCprintf( scNormal, "   Send [Enter] as: " );
-
-  switch ( NewLineMode ) {
-    case 0: s.myCprintf( scToggleStatus, "CR/LF\r\n\r\n" ); break;
-    case 1: s.myCprintf( scToggleStatus, "CR\r\n\r\n" ); break;
-    case 2: s.myCprintf( scToggleStatus, "LF\r\n\r\n" ); break;
-    case 3: s.myCprintf( scToggleStatus, "CR/NUL\r\n\r\n" ); break;
-    case 4: s.myCprintf( scToggleStatus, "AUTO\r\n\r\n" ); break;
+  uint16_t *start = (uint16_t far *)(s.Screen_base + 2*s.terminalCols);
+  for ( int i = 0; i < 17; i++ ) {
+    if ( s.isPreventSnowOn( ) & ((i & 0x1) == 0) ) { waitForCGARetraceLong( ); }
+    fillUsingWord( start, (scNormal<<8|32), s.terminalCols );
+    start += s.terminalCols;
   }
 
+  s.repeatCh( 0, 1, scBorder, 205, s.terminalCols );
 
+  int i = 0;
+  while ( HelpMenu[i].x != 99 ) {
+    s.myCprintf( HelpMenu[i].x, HelpMenu[i].y, *HelpMenu[i].attr, HelpMenu[i].string );
+    i++;
+  }
 
-  s.myCprintf( scNormal, "Tcp: Sent %lu Rcvd %lu Retrans %lu Seq/Ack errs %lu Dropped %lu\r\n",
+  s.myCprintf( 22, 11, scToggleStatus, "%d  ", BackScrollPages );
+  s.myCprintf( 31, 11, scToggleStatus, "%s", (LocalEcho?"On":"Off") );
+  s.myCprintf( 43, 11, scToggleStatus, "%s", (s.isWrapModeOn( )?"On":"Off") );
+  s.myCprintf( 59, 11, scToggleStatus, "%s", TermType );
+  s.myCprintf( 26, 12, scToggleStatus, "%s", (SendBsAsDel?"On":"Off") );
+  s.myCprintf( 48, 12, scToggleStatus, NewLineModes[NewLineMode] );
+
+  s.myCprintf( 0, 14, scNormal, "Tcp: Sent %lu Rcvd %lu Retrans %lu Seq/Ack errs %lu Dropped %lu",
                Tcp::Packets_Sent, Tcp::Packets_Received, Tcp::Packets_Retransmitted,
                Tcp::Packets_SeqOrAckError, Tcp::Packets_DroppedNoSpace );
-  s.myCprintf( scNormal, "Packets: Sent: %lu Rcvd: %lu Dropped: %lu SendErrs: LowFreeBufs: %u\r\n\r\n",
+  s.myCprintf( 0, 15, scNormal, "Packets: Sent: %lu Rcvd: %lu Dropped: %lu SendErrs: LowFreeBufs: %u",
 	   Packets_sent, Packets_received, Packets_dropped, Packets_send_errs, Buffer_lowFreeCount );
 
-  s.myCprintf( scBright, "Press a key to go back to your session ...\r\n" );
+  s.repeatCh( 0, 18, scBorder, 205, s.terminalCols );
 
-  s.repeatCh( 0, 18, scBorder, 205, 80 );
+  gotoxy( 43, 17 );
 }
 
 
 
 
 char *HelpText[] = {
-  "\ntelnet <ipaddr> [port]\n\n",
+  "\ntelnet [options] <ipaddr> [port]\n\n",
   "Options:\n",
   "  -help                      Shows this help\n",
-  "  -debug_ansi                Turn on debuging for ANSI escape codes\n",
-  "  -debug_telnet              Turn on debugging for telnet options\n",
   "  -sessiontype <telnet|raw>  Force telnet mode or raw mode instead\n",
   NULL
 };
@@ -1107,7 +1241,7 @@ char *HelpText[] = {
 
 
 static void usage( void ) {
-  uint8_t i=0;
+  uint16_t i=0;
   while ( HelpText[i] != NULL ) {
     printf( HelpText[i] );
     i++;
@@ -1119,7 +1253,7 @@ static void usage( void ) {
 
 static void parseArgs( int argc, char *argv[] ) {
 
-  uint8_t RawOrTelnetForced = 0;
+  bool RawOrTelnetForced = false;
 
   int i=1;
   for ( ; i<argc; i++ ) {
@@ -1130,14 +1264,18 @@ static void parseArgs( int argc, char *argv[] ) {
       usage( );
     }
     else if ( stricmp( argv[i], "-debug_telnet" ) == 0 ) {
-      strcpy( Utils::LogFile, "telnet.log" );
-      Utils::Debugging |= 3;
+      #ifndef NOTRACE
+      strcpy( Trace_LogFile, "telnet.log" );
+      Trace_Debugging |= 3;
       DebugTelnet = 1;
+      #endif
     }
     else if ( stricmp( argv[i], "-debug_ansi" ) == 0 ) {
-      strcpy( Utils::LogFile, "telnet.log" );
-      Utils::Debugging |= 3;
+      #ifndef NOTRACE
+      strcpy( Trace_LogFile, "telnet.log" );
+      Trace_Debugging |= 3;
       DebugAnsi = 1;
+      #endif
     }
     else if ( stricmp( argv[i], "-sessiontype" ) == 0 ) {
       i++;
@@ -1146,12 +1284,12 @@ static void parseArgs( int argc, char *argv[] ) {
 	usage( );
       }
       if ( stricmp( argv[i], "raw" ) == 0 ) {
-	RawOrTelnet = 0;
-	RawOrTelnetForced = 1;
+	RawOrTelnet = false;
+	RawOrTelnetForced = true;
       }
       else if ( stricmp( argv[i], "telnet" ) == 0 ) {
-	RawOrTelnet = 1;
-	RawOrTelnetForced = 1;
+	RawOrTelnet = true;
+	RawOrTelnetForced = true;
       }
       else {
 	puts( "Unknown session type specified on the -sessiontype option" );
@@ -1181,7 +1319,7 @@ static void parseArgs( int argc, char *argv[] ) {
       printf( "If you specify a port it can't be this: %s\n", argv[i] );
       usage( );
     }
-    if ( serverPort != 23 && (RawOrTelnetForced == 0) ) RawOrTelnet = 0;
+    if ( serverPort != 23 && (!RawOrTelnetForced) ) RawOrTelnet = false;
   }
 
 
@@ -1241,6 +1379,11 @@ void getCfgOpts( void ) {
     strcpy( TermType, tmpTermType );
   }
 
+  Utils::getAppValue( "TELNET_COLOR_SCHEME", tmp, 10 );
+  if ( stricmp( tmp, "CGA_MONO" ) == 0 ) {
+    ColorScheme = 1;
+  }
+
   Utils::closeCfgFile( );
 
 }
@@ -1251,11 +1394,13 @@ void getCfgOpts( void ) {
 
 static void shutdown( int rc ) {
 
-  setvect( 0x1b, oldCtrlBreakHandler);
+  // Take advantage of our screen variable being a global and initialized to
+  // zeros.  If the Screen_base member is set then the screen was
+  // initialized
+  // 
+  if ( s.Screen_base != NULL ) s.paint( );
 
   Utils::endStack( );
-  Utils::dumpStats( stderr );
-  fclose( TrcStream );
   exit( rc );
 }
 
@@ -1263,15 +1408,10 @@ static void shutdown( int rc ) {
 
 
 
-
-
-
 // processSocket - read and process the data received from the socket
 //
-// Return code is the number of bytes that were left in the buffer.
-// If bytes are left in the buffer they will be moved to the beginning
-// of the buffer so that the next socket read will append to them and
-// have room to do so.
+// Return code is the number of bytes that were left in the buffer and not
+// processed.
 
 static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
@@ -1282,15 +1422,18 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
       if ( recvBuffer[i] == '[' ) {
 
-        // Start of CSI - reset all of the parameter parsing globals
+        // Wipe out the CSI parsing variables here.  processCSISeq
+        // can not do it because it must be able to pick up where it left
+        // off if we had an incomplete sequence.
 
-        for ( int i = 0; i < CSI_ARGS; i++ ) parms[i] = CSI_DEFAULT_ARG;
-	parmsFound = 0;
+        for ( uint16_t j = 0; j < CSI_ARGS; j++ ) parms[j] = CSI_DEFAULT_ARG;
+        parmsFound = 0;
         decPrivateControl = false;
         csiParseState = LookForPrivateControl;
         traceBufferLen = 0;
 
 	StreamState = CSI_SEEN;
+
       }
       else {
 	// Esc char was eaten - return to normal processing.
@@ -1299,15 +1442,19 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
         // We can handle simple one character escape sequences without
         // too much drama.
-        processNonCSIEscSeq( recvBuffer+i );
+        processNonCSIEscSeq( recvBuffer[i] );
       }
 
     }
 
     else if ( StreamState == CSI_SEEN ) {
+
       uint16_t rc = processCSISeq( recvBuffer+i, (len-i) );
-      s.updateVidBufPtr( );
+
+      // Bump i by the number of *additional* bytes processed
       i = i + rc - 1;
+
+      s.updateVidBufPtr( );
     }
 
     else if ( StreamState == IAC_SEEN ) {
@@ -1335,15 +1482,17 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
         //
         // The buffer slide doesn't help in our error condition, but eventually
         // we'll read the socket and figure out there is a problem.
+        //
+        // Remember, rc can be -1.  In that case do nothing; the socket is dead
+        // and that will be detected soon enough.
 
-	if ( rc > 0 ) {
-	  i = i + (rc-1);
-	}
-	else {
+        if ( rc == 0 ) {
 	  // Ran out of data in the buffer!
 	  // Move data and break the loop.
 	  memmove( recvBuffer, recvBuffer+i, (len-i) );
 	  break;
+        } else if ( rc > 0 ) {
+	  i = i + (rc-1);
 	}
 
       }
@@ -1354,12 +1503,12 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 
     else {
 
-      if ( (RawOrTelnet == 1) && recvBuffer[i] == TEL_IAC ) {
+      if ( (RawOrTelnet) && recvBuffer[i] == TEL_IAC ) {
 	StreamState = IAC_SEEN;
       }
 
       else if ( recvBuffer[i] == 27 ) {
-        s.overhang = false;
+        s.suppressOverhang( );
 	StreamState = ESC_SEEN;
       }
 
@@ -1419,7 +1568,6 @@ static uint16_t processSocket( uint8_t *recvBuffer, uint16_t len ) {
 //
 // Return codes: n is the number of input bytes consumed
 //               0 if the input buffer was incomplete (try again later)
-//              -1 send error (probably fatal)
 
 
 uint8_t telnetOptionsOutput[ 100 ];
@@ -1482,28 +1630,7 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
     TRACE(( "Consumed %d bytes of telnet options bytes, Sending %d bytes of response data\n", inputBytesConsumed, outputBufLen ));
   }
 
-  // Push the output data out.  This is super paranoid, but do the full loop
-  // including processing packets in between to ensure that they get sent.
-
-  int16_t bytesSent = 0;
-
-  while ( outputBufLen ) {
-
-    int16_t rc = mySocket->send( telnetOptionsOutput+bytesSent, outputBufLen );
-
-    PACKET_PROCESS_SINGLE;
-    Arp::driveArp( );
-    Tcp::drivePackets( );
-
-    if ( rc == -1 ) {
-      return -1;
-    }
-    else if ( rc > 0 ) {
-      bytesSent += rc;
-      outputBufLen -= rc;
-    }
-  }
-
+  send( telnetOptionsOutput, outputBufLen );
 
   return inputBytesConsumed;
 } 
@@ -1526,6 +1653,8 @@ int16_t processTelnetCmds( uint8_t *cmdStr, uint8_t cmdSize ) {
 //
 // The outputBufLen parm is used a secondary return code.
 
+const char DoOrDontPendingErrMsg[] = "Was waiting for a reply so no response sent\n";
+
 static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint8_t *outputBuf, uint16_t *outputBufLen ) {
 
   uint8_t localOutputBufLen = 0;
@@ -1537,7 +1666,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
   if ( inputBytes < 1 ) return 0;
 
   char debugMsg[120];
-  uint8_t debugMsgLen = 0;
+  uint16_t debugMsgLen = 0;
 
   // Return code is how many bytes to remove from stream.
   uint16_t inputBytesConsumed = 1;
@@ -1577,7 +1706,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       if ( MyTelnetOpts.isDoOrDontPending( cmdTableIndex ) ) {
 	MyTelnetOpts.clrDoOrDontPending( cmdTableIndex );
 	if ( DebugTelnet ) {
-	  debugMsgLen += sprintf( debugMsg+debugMsgLen, "Was waiting a reply so no resp sent\n" );
+	  debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
 	}
       }
       else {
@@ -1620,7 +1749,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       if ( MyTelnetOpts.isDoOrDontPending( cmdTableIndex ) ) {
 	MyTelnetOpts.clrDoOrDontPending( cmdTableIndex );
 	if ( DebugTelnet ) {
-	  debugMsgLen += sprintf( debugMsg+debugMsgLen, "Was waiting a reply so no resp sent\n" );
+	  debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
 	}
       }
       else {
@@ -1669,7 +1798,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       if ( MyTelnetOpts.isWillOrWontPending( cmdTableIndex ) ) {
 	MyTelnetOpts.clrWillOrWontPending( cmdTableIndex );
 	if ( DebugTelnet ) {
-	  debugMsgLen += sprintf( debugMsg+debugMsgLen, "Was waiting a reply so no resp sent\n" );
+	  debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
 	}
       }
       else {
@@ -1726,7 +1855,7 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
       if ( MyTelnetOpts.isWillOrWontPending( cmdTableIndex ) ) {
 	MyTelnetOpts.clrWillOrWontPending( cmdTableIndex );
 	if ( DebugTelnet ) {
-	  debugMsgLen += sprintf( debugMsg+debugMsgLen, "Was waiting a reply so no resp sent\n" );
+	  debugMsgLen += sprintf( debugMsg+debugMsgLen, DoOrDontPendingErrMsg );
 	}
       }
       else {
@@ -1769,9 +1898,8 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
 
 	  localOutputBufLen = 4;
 
-	  for ( uint8_t j=0; j<strlen(TermType); j++ ) {
-	    outputBuf[localOutputBufLen++] = TermType[j];
-	  }
+          char *tmp = TermType;
+          while (*tmp) outputBuf[localOutputBufLen++] = *tmp++;
 
 	  outputBuf[localOutputBufLen++] = TEL_IAC;
 	  outputBuf[localOutputBufLen++] = TELCMD_SUBOPT_END;
@@ -1839,23 +1967,26 @@ static int16_t processSingleTelnetCmd( uint8_t *cmdStr, uint8_t inputBytes, uint
 // CSI [p] ; [p] c       2 parms
 
 
-// This gets called when we are in state CSI_SEEN, which means that
-// we have seen ESC [.
+// processCSISeq
+//
+// Process a single CSI sequence.  This gets called when we are in state
+// CSI_SEEN, which means that we have seen ESC [.
 //
 // If we run out of bytes before seeing a command we will pick up
 // where we left off.  The parms and trace buffer are all globals
 // and will be preserved across calls.
 //
-// This function returns the number of bytes consumed so that we can
-// make room for the next set of characters.
+// This function returns the number of bytes consumed.  It is guaranteed
+// to always be at least 1.
+//
+// Do not call with len = 0
 
 static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
 
-  // Early return in case the buffer was exhausted
-  if ( len == 0 ) return 0;
 
 
   // Used only for debugging/tracing
+  //
   uint16_t start_cursor_x = s.cursor_x;
   uint16_t start_cursor_y = s.cursor_y;
 
@@ -1969,6 +2100,9 @@ static uint16_t processCSISeq( uint8_t *buffer, uint16_t len ) {
 
 
 
+// This can be inline because it is just called from one place.  It saves
+// some bytes this way.
+
 void processAnsiCommand( uint8_t commandLetter ) {
 
   switch ( commandLetter ) {
@@ -2044,7 +2178,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
     }
 
 
-    // CNL - Cursor Previous Line
+    // CPL - Cursor Previous Line
     //   Move the first column of the line n lines up.  Default parm is 1.
     //   Putty does not scroll the screen if it is at the bottom.
 
@@ -2189,7 +2323,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 
     case 'L': {
       if ( parms[0] == CSI_DEFAULT_ARG ) parms[0] = 1;
-      for ( uint8_t i=0; i < parms[0]; i++ ) s.insLine( s.cursor_y );
+      for ( uint16_t i=0; i < parms[0]; i++ ) s.insLine( s.cursor_y );
       break;
     }
 
@@ -2199,28 +2333,28 @@ void processAnsiCommand( uint8_t commandLetter ) {
 
     case 'M': { // DL - Delete Lines at current cursor position
       if ( parms[0] == CSI_DEFAULT_ARG ) parms[0] = 1;
-      for ( uint8_t i=0; i < parms[0]; i++ ) s.delLine( s.cursor_y );
+      for ( uint16_t i=0; i < parms[0]; i++ ) s.delLine( s.cursor_y );
       break;
     }
 
 
-    // SU - Pan Up
+    // SU - Scroll Up/Pan Up
     //   Page is scrolled up by n lines.  New lines added at the bottom.  Default is 1.
     //   Needs to respect the scroll window
 
     case 'S': { // SU/INDN - Scroll screen up without changing cursor pos
       if ( parms[0] == CSI_DEFAULT_ARG ) parms[0] = 1;
-      for ( uint8_t i=0; i < parms[0]; i++ ) s.delLine( s.scrollRegion_top );
+      for ( uint16_t i=0; i < parms[0]; i++ ) s.delLine( s.scrollRegion_top );
       break;
     }
 
 
-    // SD - Pan Down
+    // SD - Scroll Down/Pan Down
     //   Scroll area is scrolled down by n lines.  New lines are added at the top.  Default is 1.
 
     case 'T': { // RIN - Scroll screen down without changing cursor pos
       if ( parms[0] == CSI_DEFAULT_ARG ) parms[0] = 1;
-      for ( uint8_t i=0; i < parms[0]; i++ ) s.insLine( s.scrollRegion_top );
+      for ( uint16_t i=0; i < parms[0]; i++ ) s.insLine( s.scrollRegion_top );
       break;
     }
 
@@ -2235,7 +2369,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 	parms[0] = 0;
       }
 
-      for ( uint8_t p=0; p < parmsFound; p++ ) {
+      for ( uint16_t p=0; p < parmsFound; p++ ) {
 	if ( parms[p] >= 30 && parms[p] < 40 ) {
 	  fg = fgColorMap[ parms[p] - 30 ];
 	}
@@ -2246,25 +2380,27 @@ void processAnsiCommand( uint8_t commandLetter ) {
 	  switch ( parms[p] ) {
 
 	    case 0: {
-	      reverse = underline = bold = blink = bg = 0;
+	      reverse = bold = blink = bg = 0;
+              underline = false;
 	      fg = 7;
+              setBlockCursor( );
 	      break;
 	    }
 
-	    case  1: { bold = 1; break; }      // Bold
-	    case  2: { bold = 0; break; }      // Faint
-	    case  3: { break; }                // Italic
-	    case  4: { underline = 1; break; } // Underline
-	    case  5: { blink = 1; break; }     // Slow blink
-	    case  6: { blink = 1; break; }     // Fast blink
-	    case  7: { reverse = 1; break; }   // Reverse
-	    case  8: { break; }                // Conceal
-	    case 21: { underline = 1; break; } // Double underline
-	    case 22: { bold = 0; break; }      // Normal intensity
-	    case 24: { underline = 0; break; } // No underline
-	    case 25: { blink = 0; break; }     // Blink off
-	    case 27: { reverse = 0; break; }   // Reverse off
-	    case 28: { break; }                // Conceal off
+	    case  1: { bold = 1; break; }          // Bold
+	    case  2: { bold = 0; break; }          // Faint
+	    case  3: { break; }                    // Italic
+	    case  4: { underline = true; break; }  // Underline
+	    case  5: { blink = 1; break; }         // Slow blink
+	    case  6: { blink = 1; break; }         // Fast blink
+	    case  7: { reverse = 1; break; }       // Reverse
+	    case  8: { break; }                    // Conceal
+	    case 21: { underline = true; break; }  // Double underline
+	    case 22: { bold = 0; break; }          // Normal intensity
+	    case 24: { underline = false; break; } // No underline
+	    case 25: { blink = 0; break; }         // Blink off
+	    case 27: { reverse = 0; break; }       // Reverse off
+	    case 28: { break; }                    // Conceal off
 	  }
 	}
       } // end for
@@ -2277,7 +2413,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 	newAttr = (blink<<7) | (fg<<4) | (bold<<3) | bg;
       }
 
-      if ( s.colorCard == 0 && underline ) newAttr = (blink<<7) | (bg<<4) | (bold<<3) | 0x01;
+      if ( s.isColorCard( ) && underline ) newAttr = (blink<<7) | (bg<<4) | (bold<<3) | 0x01;
       s.curAttr = newAttr;
       break;
     }
@@ -2289,7 +2425,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 
     case 'c': {
       strcpy( tmpBuf, "\033[?1;0c" );
-      mySocket->send( (uint8_t *)tmpBuf, 7 );
+      send( (uint8_t *)tmpBuf, 7 );
       break;
     }
       
@@ -2307,7 +2443,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 	case 5: {
 
 	  strcpy( tmpBuf, "\033[0n" );
-	  mySocket->send( (uint8_t *)tmpBuf, 4 );
+	  send( (uint8_t *)tmpBuf, 4 );
 	  break;
 
 	}
@@ -2320,7 +2456,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
           if ( s.originMode == true ) s.cursor_y = s.cursor_y - s.scrollRegion_top;
 
 	  int rcBytes = sprintf( tmpBuf, "\033[%d;%dR", tmpY, (s.cursor_x+1) );
-	  mySocket->send( (uint8_t *)tmpBuf, rcBytes );
+	  send( (uint8_t *)tmpBuf, rcBytes );
 	  break;
 
 	}
@@ -2331,15 +2467,14 @@ void processAnsiCommand( uint8_t commandLetter ) {
     case 'b': { // REP
       if ( parms[0] == CSI_DEFAULT_ARG ) parms[0] = 1;
 
-      if ( parms[0] > 80 ) {
-	TRACE_WARN(( "Ansi: REP Command: parm (%u) > 80\n", parms[0] ));
-	parms[0] = 80;
+      if ( parms[0] > s.terminalCols ) {
+	TRACE_WARN(( "Ansi: REP Command: parm (%u) > s.terminalCols\n", parms[0] ));
+	parms[0] = s.terminalCols;
       }
 
-      uint8_t buf[80];
-      memset( buf, s.lastChar, parms[0] );
+      memset( tmpBuf, s.lastChar, parms[0] );
 
-      s.add( (char *)buf, parms[0] );
+      s.add( (char *)tmpBuf, parms[0] );
 
       break;
     }
@@ -2385,7 +2520,7 @@ void processAnsiCommand( uint8_t commandLetter ) {
 
       if ( parms[0] == CSI_DEFAULT_ARG ) {
         parms[0] = 1;
-        parms[1] = s.ScreenRows;
+        parms[1] = s.terminalLines;
       }
 
       // Fixme - sanity check input
@@ -2437,12 +2572,14 @@ void processDecPrivateControl( uint8_t commandLetter ) {
 
     case 'h': { // Set
 
-      for ( int i = 0; i < parmsFound; i++ ) {
+      for ( uint16_t i = 0; i < parmsFound; i++ ) {
 
         if ( parms[i] == 6 ) {
           s.originMode = true;
         } else if ( parms[i] == 7 ) {
           s.autoWrap = true;
+        } else if ( parms[i] == 25 ) {
+          setBlockCursor( );
         }
 
       }
@@ -2452,12 +2589,14 @@ void processDecPrivateControl( uint8_t commandLetter ) {
 
     case 'l': { // Reset
 
-      for ( int i = 0; i < parmsFound; i++ ) {
+      for ( uint16_t i = 0; i < parmsFound; i++ ) {
 
         if ( parms[i] == 6 ) {
           s.originMode = false;
         } else if ( parms[i] == 7 ) {
           s.autoWrap = false;
+        } else if ( parms[i] == 25 ) {
+          hideCursor( );
         }
 
       }
@@ -2470,11 +2609,30 @@ void processDecPrivateControl( uint8_t commandLetter ) {
 }
 
 
-static uint16_t processNonCSIEscSeq( uint8_t *buffer ) {
+// These are single character sequences.  The best documentation I have is at
+// http://man7.org/linux/man-pages/man4/console_codes.4.html .
+//
+// If a character is not supported it is effectively eaten without any side
+// effects.
 
-  uint16_t rc = 0;
+static void processNonCSIEscSeq( uint8_t ch ) {
 
-  if ( *buffer == 'D' ) {
+  if ( ch == '7' ) {
+
+    // DECSC: Save cursor
+    //
+    // Specifically, save position, attributes from SGR, wrap flag (autowrap),
+    // original mode.  (Those are the ones we support at least.)
+
+    s.saveCursor( );
+
+  } else if ( ch == '8' ) {
+
+    // DECRC: Restore cursor 
+    //
+    s.restoreCursor( );
+
+  } else if ( ch == 'D' ) {
 
     // Index
 
@@ -2485,9 +2643,7 @@ static uint16_t processNonCSIEscSeq( uint8_t *buffer ) {
       s.cursor_y++;
     }
 
-    rc = 1;
-
-  } else if ( *buffer == 'M' ) {
+  } else if ( ch == 'M' ) {
 
     // Reverse Index
 
@@ -2498,22 +2654,21 @@ static uint16_t processNonCSIEscSeq( uint8_t *buffer ) {
       s.cursor_y--;
     }
 
-    rc = 1;
   }
 
-  else if ( *buffer == 'E' ) {
+  else if ( ch == 'E' ) {
 
     // NEL - Next Line
 
     s.adjustVertical( parms[0] );
     s.cursor_x = 0;
 
-    rc = 1;
+  } else if ( ch == 'c' ) {
+
+    // RIS: Reset to Initial State, full reset
+    s.resetTerminalState( );
 
   }
 
-  // support 'c' for reset sometime?
-
-  return rc;
 }
 

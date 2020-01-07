@@ -2,7 +2,7 @@
 /*
 
    mTCP Session.h
-   Copyright (C) 2011-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -116,6 +116,8 @@ class Session {
 
 
     char name[IRCNICK_MAX_LEN]; // Session name or identifier
+
+    uint8_t   padding;
 
     uint16_t *virtBuffer;       // Pointer to virtual buffer
     uint16_t  virtBufferRows;   // How many rows does it have

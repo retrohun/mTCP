@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Sntp.cpp
-   Copyright (C) 2010-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2010-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -28,6 +27,7 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -43,6 +43,7 @@
 
 #include "types.h"
 
+#include "trace.h"
 #include "utils.h"
 #include "packet.h"
 #include "arp.h"
@@ -70,25 +71,15 @@ time_t   TargetTime = 0;
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
-//
-// Check this flag once in a while to see if the user wants out.
+
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
+
 volatile uint8_t CtrlBreakDetected = 0;
-
-#ifdef __TURBOC__
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
-}
-#else
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
-#endif
 
 
 
@@ -194,7 +185,7 @@ int16_t setDosDateTime( void ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP SNTP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2013\n";
+static char CopyrightMsg1[] = "mTCP SNTP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -230,25 +221,14 @@ int main( int argc, char *argv[] ) {
 
 
   // No sockets, no buffers TCP buffers
-  if ( Utils::initStack( 0, 0 ) ) {
+  if ( Utils::initStack( 0, 0, ctrlBreakHandler, ctrlBreakHandler ) ) {
     puts( "Failed to initialize TCP/IP - exiting" );
     exit( 1 );
   }
 
 
-
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-  // Save off the old Ctrl-Break handler and enable our own.  Shutdown( )
-  // will restore the old handler for us.  Set the Ctrl-C handler to be the
-  // same routine, but don't worry about restoring it - DOS will do that
-  // for us.
-
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-  setvect( 0x23, ctrlBreakHandler);
-
 
 
   printf( "Resolving %s, press [ESC] to abort.\n", ServerAddrName );
@@ -469,12 +449,7 @@ void parseArgs( int argc, char *argv[] ) {
 
 
 void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-  // Utils::dumpStats( stderr );
-  fclose( TrcStream );
   exit( rc );
 }
 

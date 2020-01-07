@@ -1,8 +1,7 @@
-
 /*
 
    mTCP SpdTest.cpp
-   Copyright (C) 2011-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,6 +26,7 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -65,6 +65,7 @@
 
 #include "types.h"
 
+#include "trace.h"
 #include "utils.h"
 #include "packet.h"
 #include "arp.h"
@@ -129,38 +130,19 @@ typedef struct {
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
 
-// Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
 
-void __interrupt __far ctrlCHandler( ) {
-  // Do Nothing
-}
-#else
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
-}
-
-void interrupt ctrlCHandler( ... ) {
-  // Do Nothing
-}
-#endif
 
 
 
-
-static char CopyrightMsg1[] = "mTCP SpeedTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2011\n";
+static char CopyrightMsg1[] = "mTCP SpeedTest by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 int main( int argc, char *argv[] ) {
@@ -177,7 +159,7 @@ int main( int argc, char *argv[] ) {
     exit(-1);
   }
 
-  if ( Utils::initStack( 2, OUTGOINGBUFFERS ) ) {
+  if ( Utils::initStack( 2, OUTGOINGBUFFERS, ctrlBreakHandler, ctrlBreakHandler ) ) {
     puts( "\nFailed to initialize TCP/IP - exiting" );
     exit(-1);
   }
@@ -185,16 +167,6 @@ int main( int argc, char *argv[] ) {
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too, but do nothing.  We actually want Ctrl-C
-  // to be a legal character to send when in interactive mode.
-  setvect( 0x23, ctrlCHandler);
 
 
   initTcpXmitBuffers( );
@@ -501,12 +473,15 @@ int main( int argc, char *argv[] ) {
 
 
 char *HelpText[] = {
-  "\nspdtest -target <ipaddr> <port>  or  spdtest -listen <port>\n\n",
+  "Usage:\n\n",
+  "  spdtest <mode> -target <ipaddr> <port> [-srcport <n>]\n",
+  "    or\n",
+  "  spdtest <mode> -listen <port> [options]\n\n",
+  "Mode is either:\n",
+  "  -receive      Do a receive test\n",
+  "  -send         Do a send test\n\n",
   "Options:\n",
-  "  -help         Shows this help\n",
   "  -srcport <n>  Specify local source port for socket when using -target\n",
-  "  -receive      Do a receive only test\n",
-  "  -send         Do a send only test\n",
   "  -mb <n>       Megabytes to send during a send test\n",
   NULL
 };
@@ -531,6 +506,7 @@ void usage( void ) {
 
 void errorMsg( char *msg ) {
   puts( msg );
+  puts( "" );
   usage( );
   exit( 1 );
 }
@@ -680,12 +656,8 @@ void parseEnv( void ) {
 
 
 void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
   Utils::dumpStats( stderr );
-  fclose( TrcStream );
   exit( rc );
 }
 

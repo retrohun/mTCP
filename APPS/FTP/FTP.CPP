@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ftp.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -34,18 +33,16 @@
    2013-03-18: Increase user input area to two lines
    2013-03-28: Add limited packet handling during user input;
                Add support for screens larger than 80x25
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
+   2015-02-27: Add mdelete command, redo help text.
+   2015-02-28: Collapse send and recieve file buffers into one buffer;
+               Remove restrictions on local file length to allow for
+               paths and filenames.  DOS will protect us against
+               bad paths and names.
+   2015-05-29: Update PASV parsing to ignore third party servers.
 
 */
 
-
-
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-#include <malloc.h>
-#else
-#include <alloc.h>
-#include <dir.h>
-#endif
 
 #include <bios.h>
 #include <conio.h>
@@ -53,6 +50,7 @@
 #include <direct.h>
 #include <dos.h>
 #include <io.h>
+#include <malloc.h>
 #include <mem.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -63,8 +61,9 @@
 
 #include "types.h"
 
-#include "utils.h"
 #include "timer.h"
+#include "trace.h"
+#include "utils.h"
 #include "packet.h"
 #include "arp.h"
 #include "udp.h"
@@ -81,15 +80,13 @@
 #define CONTROL_RECV_SIZE     (512) // Control socket recv buffer
 #define INBUFSIZE             (512) // Command line buffer
 #define MLIST_BUF_SIZE       (4096) // Buffer for MGET/MPUT filename list
-#define DATA_RECV_SIZE       (8192) // Default Data socket recv buffer
-#define RECV_FILE_BUF_SIZE   (8192) // Default file buffer size
-#define SEND_FILE_BUF_SIZE   (8192) // Default file buffer size
+#define TCP_RECV_SIZE        (8192) // Default Data socket recv buffer
+#define FILE_BUF_SIZE        (8192) // Default file buffer size
 
 #define FTPSERVERNAME_MAX_LEN  (64) // Max len of the ftp server name
 #define USERINPUTBUF_MAX_LEN  (140) // Max len of input line a user can type
 #define COMMAND_MAX_LEN        (20) // Max len of a user command
-#define SERVERFILE_MAX_LEN     (80) // Max len of a filename on the server
-#define LOCALFILE_MAX_LEN      (13) // Max len of a local filename
+#define FILESPEC_MAX_LEN       (80) // Max len of a filespec
 #define USERNAME_MAX_LEN       (64) // Max len of a username
 #define PASSWORD_MAX_LEN       (40) // Max len of a password
 
@@ -103,7 +100,10 @@ enum ClientState_t {
   SentUser,           // Send username
   UserOkSendPass,     // Got a response back after sending username
   SentPass,           // Sent password
+
   CmdLine,            // Made it to command line
+
+  BinStuffed,         // Stuff a BIN command in.  (Optional)
 
   ListSentPasv,       // Sent PASV, will send LIST next
   ListSentAfterPasv,  // Sent LIST after sending PASV   - we will connect
@@ -139,7 +139,7 @@ enum ClientState_t {
 
 ClientState_t ClientState = Uninitialized;
 
-uint8_t MultilineResponse = 0;
+bool MultilineResponse = false;
 
 
 
@@ -199,36 +199,33 @@ TransferModes_t TransferMode = Passive;
 char *TransferModeStrings[] = { "Classic", "Passive", "Port" };
 
 
-
-
-char ServerFile[SERVERFILE_MAX_LEN];    // Also used as Rename 'from' file
-char LocalFile[LOCALFILE_MAX_LEN];      // Name to use locally
-char DirParm[SERVERFILE_MAX_LEN];       // Used for DIR and LS commands
-char RenameToParm[SERVERFILE_MAX_LEN];  // Used only as Rename 'to' parm
+bool StuffBinCommandAtStart = true;
 
 
 
+char ServerFile[FILESPEC_MAX_LEN];    // Also used as Rename 'from' file
+char LocalFile[FILESPEC_MAX_LEN];     // Name to use locally
+char RenameToParm[FILESPEC_MAX_LEN];  // Used only as Rename 'to' parm
 
 
-// For sending and receiving data
 
-uint16_t DataRecvSize    = DATA_RECV_SIZE; // Can override with env var
-uint16_t RecvFileBufSize = RECV_FILE_BUF_SIZE;  // Can override with env var
-uint16_t SendFileBufSize = SEND_FILE_BUF_SIZE;  // Can override with env var
+uint16_t TcpRecvSize = TCP_RECV_SIZE;   // TCP socket receive buffer size
+uint16_t FileBufSize  = FILE_BUF_SIZE;  // File transfer buffer size
 
 uint8_t *FileBuffer;
 
 
 
-// mList buffer for mput and mget
+// mList buffer for mput, mget and mdelete
 
 uint16_t mListBufSize = MLIST_BUF_SIZE; // Can override with env var
 
 char    *mList = NULL;       // Pointer to allocated buffer
 char    *mListIndex = NULL;  // Pointer that shows how much buffer was used
 
-uint8_t ReadingForMget = 0;  // Toggle for use in receiveFileList
-uint8_t MgetMputPrompt = 0;  // Toggle for prompting on mget/mput
+bool ReadingForMget = false;  // Toggle for use in receiveFileList
+bool MgetMputPrompt = true;   // Toggle for prompting on mget/mput
+
 
 
 uint8_t ScreenPager = 0;
@@ -265,21 +262,20 @@ uint16_t  inBufSearchIndex=0;    // Where to continue searching for \r\n
 
 
 
-uint8_t  isValidDosFilename( const char *filename );
+bool isValidDosFilename( const char *filename );
 
 char    *current_directory(char *path);
 
 
 // Stdin and Stdout helpers
 
-uint8_t IsStdinFile = 0;
-uint8_t IsStdoutFile = 0;
+bool IsStdinFile = false;
+bool IsStdoutFile = false;
 void probeStdinStdout( void );
 
 int readStdin( char *buffer, int bufLen );
-int readConsole( char *buffer, int bufLen, int enableCmdEdit );
+int readConsole( char *buffer, int bufLen, bool enableCmdEdit );
 
-// int msdosRead( char *buffer, int bufLen );
 
 
 
@@ -307,6 +303,7 @@ void doGet( void );
 void doPut( void );
 void doMput( char *filespec );
 void doMget( char *filespec );
+void doMdelete( char *filespec );
 
 
 // Data Socket data transfer functions
@@ -319,104 +316,20 @@ int8_t sendFile( void );
 
 
 
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
-//
-// Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
-#else
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
-}
-#endif
-
-
-
-
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-
-extern void fillUsingWord( uint16_t far * target, uint16_t fillWord, uint16_t len );
-#pragma aux fillUsingWord = \
-  "push es"    \
-  "push di"    \
-  "mov es, dx" \
-  "mov di, bx" \
-  "rep stosw"  \
-  "pop di"     \
-  "pop es"     \
-  modify [ax cx] \
-  parm [dx bx] [ax] [cx]
-
-extern unsigned char wherex( void );
-#pragma aux wherex = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dl ];
-
-extern unsigned char wherey( void );
-#pragma aux wherey = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dh ];
-
-extern void gotoxy( unsigned char col, unsigned char row );
-#pragma aux gotoxy = \
-  "push bp"     \
-  "mov ah, 2h" \
-  "mov bh, 0h"  \
-  "int 10h" \
-  "pop bp"  \
-  parm [dl] [dh] \
-  modify [ax bh dx];
-
-#endif
 
 
 
 
 uint8_t far *Screen_base;
 uint16_t ScreenRows, ScreenCols;
-
-char cprintfBuffer[80];
-
-void myCprintf( uint8_t x, uint8_t y, char *fmt, ... ) {
-
-  va_list ap;
-  va_start( ap, fmt );
-  vsnprintf( cprintfBuffer, 80, fmt, ap );
-  va_end( ap );
-
-  cprintfBuffer[79] = 0;
-
-  uint16_t far *start = (uint16_t far *)(Screen_base + (y*ScreenCols+x)*2);
-
-  uint16_t len = strlen( cprintfBuffer );
-
-  for ( uint16_t i = 0; i < len; i++ ) {
-    *start++ = ( 7 << 8 | cprintfBuffer[i] );
-  }
-
-}
-
 
 
 // Command history support
@@ -428,13 +341,6 @@ void myCprintf( uint8_t x, uint8_t y, char *fmt, ... ) {
 #define PREVIOUS_COMMANDS (11)
 
 static void complain( void ) { sound(500); delay( 50); nosound( ); }
-
-inline void clrLine( int x, int y  ) {
-  uint16_t far *target = (uint16_t far *)(Screen_base + (y)*ScreenCols*2 + (x)*2 );
-  uint16_t len = ScreenCols - x;
-  uint16_t fillWord = ( 0x0700 | 0x20 );
-  fillUsingWord( target, fillWord, len );
-}
 
 char previousCommands[PREVIOUS_COMMANDS][USERINPUTBUF_MAX_LEN];
 int previousCommandIndex = 0;
@@ -450,13 +356,25 @@ static void initCommandHistory( void ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP FTP by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2013\n";
-static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
+// Useful strings
 
+const char BytesTransferred_fmt[] = "Bytes transferred: %lu";
+const char CtrlBreakCmdState_msg[] = "\nCtrl-Break detected - cleaning up to go to command state.\n";
+const char DataSocketClosed_fmt[] = "Data socket closed early - close reason: %d\n";
+const char NotEnoughMemory_msg[] = "Not enough free memory";
+const char PressAKey_msg[] = "Press a key to continue ...";
+const char TransferModeIs_fmt[] = "Transfer mode is set to: %s\n";
+const char XferAborted_msg[] = "Xfer aborted due to Ctrl-Break";
+const char NeedAFilename_msg[] = "You need to provide a filename";
+const char NoMatches_msg[] = "No names on the remote server matched.";
+const char Spaces[] = "                                        ";
+
+
+static char CopyrightMsg[] = "mTCP FTP by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2020\nVersion: " __DATE__ "\n";
 
 int main( int argc, char *argv[] ) {
 
-  printf( "%s  %s", CopyrightMsg1, CopyrightMsg2 );
+  puts( CopyrightMsg );
 
   // Parse args, environment and read config file
   parseArgs( argc, argv );
@@ -499,15 +417,11 @@ int main( int argc, char *argv[] ) {
 
 
   inBuf      = (uint8_t *)malloc( INBUFSIZE );
-
-  uint16_t fileBufSize = (RecvFileBufSize > SendFileBufSize) ? RecvFileBufSize : SendFileBufSize;
-  FileBuffer = (uint8_t *)malloc( fileBufSize );
-
+  FileBuffer = (uint8_t *)malloc( FileBufSize );
   mList      = (char *)malloc( mListBufSize );
 
-
   if ( (inBuf == NULL) || (FileBuffer == NULL) || (mList == NULL) ) {
-    puts( "Not enough free memory" );
+    puts( NotEnoughMemory_msg );
     exit(1);
   }
 
@@ -516,22 +430,13 @@ int main( int argc, char *argv[] ) {
 
   // Three sockets (Control, Listen, and Data)
   // 10 outgoing TCP buffers
-  if ( Utils::initStack( 3, 10 ) ) {
+  if ( Utils::initStack( 3, 10, ctrlBreakHandler, ctrlBreakHandler ) ) {
     puts( "Could not start TCP/IP" );
     exit(1);
   }
 
 
   // From this point forward you must use shutdown( ) to exit.
-
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);  // Ctrl-Break handler
-  setvect( 0x23, ctrlBreakHandler);  // Ctrl-C handler
-
 
 
   if ( resolveServer( FtpServer, FtpServerAddr ) ) {
@@ -549,7 +454,7 @@ int main( int argc, char *argv[] ) {
   // Open socket to server
   int8_t rc = ControlSocket->setRecvBuffer( CONTROL_RECV_SIZE );
   if ( rc ) {
-    puts( "Not enough free memory" );
+    puts( NotEnoughMemory_msg );
     shutdown( -1 );
   }
 
@@ -591,7 +496,7 @@ int main( int argc, char *argv[] ) {
 
       if ( (ClientState > SentPass) && (ClientState < Closing) ) {
 
-        puts( "\nCtrl-Break detected - cleaning up to go to command state.\n" );
+        puts( CtrlBreakCmdState_msg );
         CtrlBreakDetected = 0;
         closeDataSockets( );
 
@@ -624,7 +529,6 @@ int main( int argc, char *argv[] ) {
         if ( rc ) break;
       }
       else {
-        //msdosRead( lineBuffer, USERINPUTBUF_MAX_LEN );
 
         if ( ClientState == CmdLine ) {
           readConsole( lineBuffer, USERINPUTBUF_MAX_LEN, 1 );
@@ -667,7 +571,7 @@ void parseArgs( int argc, char *argv[] ) {
 
   if ( argc < 2 ) usage( );
 
-  uint8_t i=1;
+  uint16_t i=1;
   for ( ; i<argc; i++ ) {
 
     if ( stricmp( argv[i], "-port" ) == 0 ) {
@@ -729,22 +633,21 @@ void readConfigParms( void ) {
 
   if ( Utils::getAppValue( "FTP_TCP_BUFFER", tmp, 10 ) == 0 ) {
     tmpVal = atoi( tmp );
-    if ( (tmpVal >= 512) && (tmpVal <= 16384) ) DataRecvSize = tmpVal;
+    if ( (tmpVal >= 512) && (tmpVal <= 16384) ) TcpRecvSize = tmpVal;
   }
 
   if ( Utils::getAppValue( "FTP_FILE_BUFFER", tmp, 10 ) == 0 ) {
     tmpVal = atoi( tmp );
-    if ( (tmpVal >= 512) && (tmpVal <= 32768) ) RecvFileBufSize = tmpVal;
-  }
-
-  if ( Utils::getAppValue( "FTP_SEND_FILE_BUFFER", tmp, 10 ) == 0 ) {
-    tmpVal = atoi( tmp );
-    if ( (tmpVal >= 512) && (tmpVal <= 16384) ) SendFileBufSize = tmpVal;
+    if ( (tmpVal >= 512) && (tmpVal <= 32768) ) FileBufSize = tmpVal;
   }
 
   if ( Utils::getAppValue( "FTP_MLIST_BUFFER", tmp, 10 ) == 0 ) {
     tmpVal = atoi( tmp );
     if ( (tmpVal >= 512) && (tmpVal <= 16384) ) mListBufSize = tmpVal;
+  }
+
+  if ( Utils::getAppValue( "FTP_BIN_CMD_STUFF", tmp, 10 ) == 0 ) {
+    if ( stricmp( tmp, "false" ) == 0 ) StuffBinCommandAtStart = false;
   }
 
   Utils::closeCfgFile( );
@@ -789,13 +692,7 @@ int8_t resolveServer( char *name, IpAddr_t addr ) {
 
 
 void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-  puts( "" );
-  Utils::dumpStats( stderr );
-  fclose( TrcStream );
   puts( "\nPlease send comments and bug reports to mbbrutman@gmail.com\n");
   exit( rc );
 }
@@ -803,35 +700,59 @@ void shutdown( int rc ) {
 
 
 static char *HelpMenu[] = {
-"\nCommands\n",
+
+"",
+CopyrightMsg,
+
+"Directory operations:\n",
+
 "  dir [<filespec>]    Show a detailed directory list",
 "  ls  [<filespec>]    Directory list without detail",
 "  pager <n>           Pause ls or dir output after approximately n lines\n",
 
-"  cd                  Change directory on server (Alias: cwd)",
+"  cd [<directory>]    Change directory on server (Alias: cwd)",
 "  cdup                Move up one directory on server",
 "  pwd                 Show current directory on server\n",
 
 "  lcd [<dir>]         Show current dir or change dir on local machine",
-"  lmd [<newdir>]      Create new directory on local machine\n",
+"  lmd <newdir>        Create new directory on local machine\n",
 
-"  ascii               Set ASCII transfer mode",
-"  image               Set IMAGE transfer mode\n"
-"  binary or bin       Aliases for image command\n"
-
-"  get <file> [<new>]  Get <file> from server, use <new> for target",
-"  put <file> [<new>]  Send <file> to server, use <new> for target",
-"  mget <filespec>     Multi-file get",
-"  mput <filespec>     Multi-file put",
+"  mkdir <dirname>     Make directory <dirname> on FTP server (Alias: md)",
+"  rmdir <dirname>     Remove directory <dirname> on FTP server (Alias: rd)\n",
 
 "#", // Break output here and wait for keyboard input
 
-"\n  prompt              Toggle mget/mput prompting on or off",
-"  xfermode <mode>     Set file transfer mode to CLASSIC, PORT or PASSIVE\n",
-"  delete <filename>   Delete <filename> on FTP server (Alias: del)",
-"  mkdir <dirname>     Make directory <dirname> on FTP server (Alias: md)",
-"  rmdir <dirname>     Remove directory <dirname> on FTP server (Alias: rd)",
+"Setting the file transfer mode:\n",
+
+"  ascii               Set ASCII transfer mode",
+"  image               Set IMAGE transfer mode",
+"  binary or bin       Aliases for image command\n",
+
+"  Note! The server determines the default file transfer mode.  To be safe",
+"  always set the mode before moving a file.  IMAGE is usually what you want.\n",
+
+"File operations:\n",
+
+"  get <file> [<new>]  Get <file> from server, use <new> for target",
+"  put <file> [<new>]  Send <file> to server, use <new> for target",
+"  delete <filename>   Delete <filename> on FTP server (Alias: del)\n",
+
+"  prompt              Toggle mget/mput/mdelete prompting on or off\n",
+
+"  mget <filespec>     Multi-file get",
+"  mput <filespec>     Multi-file put",
+"  mdelete <filespec>  Multi-file delete\n",
+
 "  rename <from> <to>  Rename file on server\n",
+
+"#", // Break output here and wait for keyboard input
+
+"Other commands:\n",
+
+"  xfermode [<mode>]   Show the current transfer mode or set file transfer",
+"                      mode to CLASSIC, PORT or PASSIVE.\n",
+
+"  Hint: xfermode PASSIVE works well with most firewalls. CLASSIC is obsolete.\n",
 
 "  quote <string>      Send <string> to FTP server to be interpreted",
 "  quit                Self explanatory (Aliases: exit bye close)",
@@ -847,11 +768,10 @@ NULL
 
 
 
-
+// Entering a user name or entering a password need to be done if the server
+// prompts for it.  Otherwise, we are just processing a generic command.
 
 void processUserInput( char *buffer ) {
-
-  if ( *buffer == 0 ) return;
 
   if ( ClientState < CmdLine ) {
 
@@ -874,6 +794,13 @@ void processUserInput( char *buffer ) {
 
 void processUserInput2( char *lineBuffer ) {
 
+  // This is used by mget, mput and mdelete.  mget and mput only expect a DOS
+  // filespec to be 13 chars including the trailing null.  mdelete can have
+  // a longer filespec because we'll just pass it through to the server,
+  // which might support longer filenames.
+
+  char filespec[60];
+
   char command[COMMAND_MAX_LEN];
   char *nextTokenPtr = Utils::getNextToken( lineBuffer, command, COMMAND_MAX_LEN );
 
@@ -884,17 +811,21 @@ void processUserInput2( char *lineBuffer ) {
 
   if ( stricmp( command, "help" ) == 0 ) {
 
-    puts( "mTCP FTP by M Brutman (mbbrutman@gmail.com), Version: " __DATE__ );
-
-    uint8_t i=0;
+    uint16_t i=0;
     while ( HelpMenu[i] != NULL ) {
 
       if ( HelpMenu[i][0] == '#' ) {
-
-        puts( "Press a key to continue ..." );
+        int startX = wherex( );
+        int startY = wherey( );
+        printf( PressAKey_msg );
+        fflush( stdout );
         while ( bioskey(1) == 0 ) { }
         bioskey(0);
 
+        // Write enough spaces to clear out the prompt
+        gotoxy( startX, startY );
+        cputs( Spaces );
+        gotoxy( startX, startY );
       }
       else {
         puts( HelpMenu[i] );
@@ -907,9 +838,9 @@ void processUserInput2( char *lineBuffer ) {
   else if ( stricmp( command, "dir" ) == 0 ) {
 
     // Is there an optional parm?
-    Utils::getNextToken( nextTokenPtr, DirParm, SERVERFILE_MAX_LEN );
+    Utils::getNextToken( nextTokenPtr, ServerFile, FILESPEC_MAX_LEN );
 
-    ReadingForMget = 0;
+    ReadingForMget = false;
 
     if ( TransferMode == Passive ) {
       sendPasvCommand( );
@@ -933,9 +864,9 @@ void processUserInput2( char *lineBuffer ) {
   else if ( stricmp( command, "ls" ) == 0 ) {
 
     // Is there an optional parm?
-    Utils::getNextToken( nextTokenPtr, DirParm, SERVERFILE_MAX_LEN );
+    Utils::getNextToken( nextTokenPtr, ServerFile, FILESPEC_MAX_LEN );
 
-    ReadingForMget = 0;
+    ReadingForMget = false;
     doNlst( );
   }
 
@@ -943,43 +874,18 @@ void processUserInput2( char *lineBuffer ) {
 
     // Did they provide a filename?
 
-    char *pos = Utils::getNextToken( nextTokenPtr, ServerFile, SERVERFILE_MAX_LEN );
+    char *pos = Utils::getNextToken( nextTokenPtr, ServerFile, FILESPEC_MAX_LEN );
 
     if ( *ServerFile == 0 ) {
-      puts( "Need to provide a filename for the get" );
+      puts( NeedAFilename_msg );
     }
     else {
 
       // Did they provide a new filename for the local target file?
-      Utils::getNextToken( pos, LocalFile, LOCALFILE_MAX_LEN );
-
-      /*
-      // Quick sanity check on the filenames
-
-      uint8_t error = 0;
-      if ( *LocalFile == 0 ) { // No localfile specified
-        if ( !isValidDosFilename(ServerFile) ) {
-          puts( "Invalid filename for DOS: please put a target filename for the 2nd parm" );
-          error = 1;
-        }
-      }
-      else {
-        if ( !isValidDosFilename(LocalFile) ) {
-          puts( "Invalid filename for DOS: please fix the second parameter" );
-          error = 1;
-        }
-      }
-
-      if ( error == 0 ) {
-        // doGet expects ServerFile and NewFile to be set.
-        doGet( );
-      }
-      */
+      Utils::getNextToken( pos, LocalFile, FILESPEC_MAX_LEN );
 
       // doGet expects ServerFile and NewFile to be set.
       doGet( );
-
-
 
     }
   }
@@ -988,39 +894,28 @@ void processUserInput2( char *lineBuffer ) {
 
     // Did they provide a filename?
 
-    char *pos = Utils::getNextToken( nextTokenPtr, LocalFile, LOCALFILE_MAX_LEN );
+    char *pos = Utils::getNextToken( nextTokenPtr, LocalFile, FILESPEC_MAX_LEN );
 
     if ( *LocalFile == 0 ) {
-      puts( "Need to provide a filename for the put" );
+      puts( NeedAFilename_msg );
     }
     else {
 
-      /*
-      if ( !isValidDosFilename( LocalFile ) ) {
-        puts( "Invalid DOS filename" );
+      // Did they provide a new name for the server filename?
+      Utils::getNextToken( pos, ServerFile, FILESPEC_MAX_LEN );
+
+      // Does this file exist?
+
+      struct stat statbuf;
+      stat(LocalFile, &statbuf);
+
+      if ( !(statbuf.st_mode & S_IFREG) ) {
+        printf( "Error: %s is not a file.\n", LocalFile );
       }
       else {
-      */
-
-        // Did they provide a new name for the server filename?
-        Utils::getNextToken( pos, ServerFile, SERVERFILE_MAX_LEN );
-
-        // Does this file exist?
-
-        struct stat statbuf;
-        stat(LocalFile, &statbuf);
-
-        if ( !(statbuf.st_mode & S_IFREG) ) {
-          printf( "Error: %s is not a file.\n", LocalFile );
-        }
-        else {
-          // doPut expects ServerFile and NewFile to be set.
-          doPut( );
-        }
-
-      /*
+        // doPut expects ServerFile and NewFile to be set.
+        doPut( );
       }
-      */
 
     }
 
@@ -1072,15 +967,15 @@ void processUserInput2( char *lineBuffer ) {
 
     Utils::getNextToken( nextTokenPtr, newMode, 10 );
     if ( *newMode == 0 ) {
-      printf( "Transfer mode is: %s\n", TransferModeStrings[TransferMode] );
+      printf( TransferModeIs_fmt, TransferModeStrings[TransferMode] );
     }
     else {
 
-      uint8_t i;
+      uint16_t i;
       for (i=0; i < 3; i++ ) {
         if ( stricmp( newMode, TransferModeStrings[i] ) == 0 ) {
           TransferMode = (TransferModes_t)i;
-          printf( "Transfer mode is now: %s\n", TransferModeStrings[TransferMode] );
+          printf( TransferModeIs_fmt, TransferModeStrings[TransferMode] );
           break;
         }
       }
@@ -1105,7 +1000,7 @@ void processUserInput2( char *lineBuffer ) {
 
   else if ( stricmp( command, "quote" ) == 0 ) {
 
-    uint8_t enoughInput = 1;
+    bool enoughInput = true;
 
     if ( nextTokenPtr != NULL ) {
 
@@ -1118,12 +1013,12 @@ void processUserInput2( char *lineBuffer ) {
         ClientState = CmdSent;
       }
       else {
-        enoughInput = 0;
+        enoughInput = false;
       }
 
     }
     else {
-      enoughInput = 0;
+      enoughInput = false;
     }
 
     if ( !enoughInput ) {
@@ -1147,13 +1042,11 @@ void processUserInput2( char *lineBuffer ) {
 
   else if ( stricmp( command, "mput" ) == 0 ) {
 
-    char filespec[13];
-
     // Is there an optional parm?
-    Utils::getNextToken( nextTokenPtr, filespec, 13 );
+    Utils::getNextToken( nextTokenPtr, filespec, FILESPEC_MAX_LEN );
 
     if ( *filespec == 0 ) {
-      puts( "Need to provide a filespec." );
+      puts( NeedAFilename_msg );
     }
     else {
       doMput( filespec );
@@ -1163,16 +1056,28 @@ void processUserInput2( char *lineBuffer ) {
 
   else if ( stricmp( command, "mget" ) == 0 ) {
 
-    char filespec[13];
-
     // Is there an optional parm?
-    Utils::getNextToken( nextTokenPtr, filespec, 13 );
+    Utils::getNextToken( nextTokenPtr, filespec, FILESPEC_MAX_LEN );
 
     if ( *filespec == 0 ) {
-      puts( "Need to provide a filespec." );
+      puts( NeedAFilename_msg );
     }
     else {
       doMget( filespec );
+      ClientState = CmdLine;
+    }
+  }
+
+  else if ( stricmp( command, "mdelete" ) == 0 ) {
+
+    // Is there an optional parm?
+    Utils::getNextToken( nextTokenPtr, filespec, FILESPEC_MAX_LEN );
+
+    if ( *filespec == 0 ) {
+      puts( NeedAFilename_msg );
+    }
+    else {
+      doMdelete( filespec );
       ClientState = CmdLine;
     }
   }
@@ -1184,14 +1089,14 @@ void processUserInput2( char *lineBuffer ) {
 
   else if ( stricmp( command, "rename" ) == 0 ) {
 
-    char *pos = Utils::getNextToken( nextTokenPtr, ServerFile, SERVERFILE_MAX_LEN );
-    Utils::getNextToken( pos, RenameToParm, SERVERFILE_MAX_LEN );
+    char *pos = Utils::getNextToken( nextTokenPtr, ServerFile, FILESPEC_MAX_LEN );
+    Utils::getNextToken( pos, RenameToParm, FILESPEC_MAX_LEN );
 
     if ( *ServerFile == 0 || *RenameToParm == 0 ) {
       puts( "Format: rename <current_name> <new_name>" );
     }
     else {
-      char outBuf[ SERVERFILE_MAX_LEN + 10 ];
+      char outBuf[ FILESPEC_MAX_LEN + 10 ];
       int bytes = sprintf( outBuf, "RNFR %s" _NL_, ServerFile );
       ControlSocket->send( (uint8_t *)outBuf, bytes );
       ClientState = RenameFromSent;
@@ -1281,7 +1186,7 @@ void processUserInput2( char *lineBuffer ) {
     // No ill effect if they were reading from the console already.
 
     freopen( "CON", "rt", stdin );
-    IsStdinFile = 0;
+    IsStdinFile = false;
 
   }
 
@@ -1295,10 +1200,10 @@ void processUserInput2( char *lineBuffer ) {
 
 void processSimpleUserCmd( char *serverCmd, char *nextTokenPtr ) {
 
-  char parmName[ SERVERFILE_MAX_LEN ];
-  char outBuf[ SERVERFILE_MAX_LEN + 10 ];
+  char parmName[ FILESPEC_MAX_LEN ];
+  char outBuf[ FILESPEC_MAX_LEN + 10 ];
 
-  Utils::getNextToken( nextTokenPtr, parmName, SERVERFILE_MAX_LEN );
+  Utils::getNextToken( nextTokenPtr, parmName, FILESPEC_MAX_LEN );
 
   if ( *parmName == 0 ) {
     printf( "Need to provide a file or directory name.\n" );
@@ -1378,11 +1283,11 @@ void processSocketInput( void ) {
 
       if ( (strlen(tmpBuffer) > 3) && (tmpBuffer[3] == '-') ) {
         // Multi-line reponse
-        MultilineResponse = 1;
+        MultilineResponse = true;
       }
       else {
         // Normal return code or end of a multiline response.
-        MultilineResponse = 0;
+        MultilineResponse = false;
       }
 
     }
@@ -1439,7 +1344,7 @@ void processSocketInput( void ) {
       // because we have not done the accept yet.  If the server has not opened
       // the socket then we need to go into the accept loop anyway to wait for it.
 
-      uint8_t errorCleanupNeeded = 0;
+      bool errorCleanupNeeded = false;
 
       if ( ClientState == RetrSentAfterPasv ) {
         receiveFile( );
@@ -1449,7 +1354,7 @@ void processSocketInput( void ) {
           receiveFile( );
         }
         else {
-          errorCleanupNeeded = 1;
+          errorCleanupNeeded = true;
         }
       }
       else if ( ClientState == StorSentAfterPasv ) {
@@ -1460,7 +1365,7 @@ void processSocketInput( void ) {
           sendFile( );
         }
         else {
-          errorCleanupNeeded = 1;
+          errorCleanupNeeded = true;
         }
       }
       else if ( (ClientState == ListSentAfterPasv) || (ClientState == NListSentAfterPasv) ) {
@@ -1472,7 +1377,7 @@ void processSocketInput( void ) {
           readFileList( );
         }
         else {
-          errorCleanupNeeded = 1;
+          errorCleanupNeeded = true;
         }
       }
 
@@ -1508,6 +1413,10 @@ void processSocketInput( void ) {
       else if ( ClientState == StorSentPort ) {
         sendStorCommand( );
         ClientState = StorSentAfterPort;
+      }
+      else if ( ClientState == BinStuffed ) {
+        puts( "File transfer mode set to BIN." );
+        ClientState = CmdLine;
       }
       else {
         ClientState = CmdLine;
@@ -1592,8 +1501,21 @@ void processSocketInput( void ) {
       break;
     }
 
-
     case 230: // Logged in
+    {
+      if ( StuffBinCommandAtStart ) {
+        // Stuff a BIN command to save the user from themselves.
+        puts( "\nSetting the server file transfer mode to BIN" );
+        ControlSocket->send( (uint8_t *)"TYPE I" _NL_, 8 );
+        ClientState = BinStuffed;
+      }
+      else {
+        puts( "\nRemember: For Great Justice set BIN mode before transfering binary files!" );
+        ClientState = CmdLine;
+      }
+      break;
+    }
+
     case 250: // Requested file action completed
     case 257: // Pathname created
     {
@@ -1612,7 +1534,7 @@ void processSocketInput( void ) {
     case 350: // Requested file action pending further information
     {
       if ( ClientState == RenameFromSent ) {
-        char outBuf[ SERVERFILE_MAX_LEN + 10 ];
+        char outBuf[ FILESPEC_MAX_LEN + 10 ];
         int bytes = sprintf( outBuf, "RNTO %s" _NL_, RenameToParm );
         ControlSocket->send( (uint8_t *)outBuf, bytes );
         ClientState = RenameToSent;
@@ -1654,6 +1576,9 @@ void processSocketInput( void ) {
     case 552: // Requested file action aborted; exceeded storage allocation
     case 553: // File name not allowed
     {
+      if ( ClientState == BinStuffed ) {
+        puts( "Warning: Failed to set file transfer mode to BIN" );
+      }
       ClientState = CmdLine;
       break;
     }
@@ -1711,19 +1636,11 @@ void processCmd_Pass( char *nextTokenPtr ) {
 
   Utils::getNextToken( nextTokenPtr, password, PASSWORD_MAX_LEN );
 
-  if ( *password == 0 ) {
-    puts( "You need to enter a password" );
-  }
-  else {
-    int8_t bytes = sprintf( outBuf, "PASS %s" _NL_, password );
-    ControlSocket->send( (uint8_t *)outBuf, bytes );
-    ClientState = SentPass;
-  }
+  int8_t bytes = sprintf( outBuf, "PASS %s" _NL_, password );
+  ControlSocket->send( (uint8_t *)outBuf, bytes );
+  ClientState = SentPass;
 
 }
-
-
-
 
 
 
@@ -1733,10 +1650,10 @@ int8_t parsePASVResponse( char *pos ) {
   // Find first digit.  This should be the start of the IP addr and port
   // string.
 
-  uint8_t found = 0;
+  bool found = false;
   while ( *pos ) {
     if ( isdigit( *pos ) ) {
-      found = 1;
+      found = true;
       break;
     }
     pos++;
@@ -1758,7 +1675,19 @@ int8_t parsePASVResponse( char *pos ) {
     return -1;
   }
 
-  PasvAddr[0] = t0; PasvAddr[1] = t1; PasvAddr[2] = t2; PasvAddr[3] = t3;
+  // This line is correct as per the original RFCs.  But we are finding a lot
+  // of FTP servers behind firewalls with broken configurations such that the
+  // servers are responding to PASV commands with the wrong address.
+  // From now on just ignore any IP address and use the original server
+  // address with the new port.
+  //
+  // PasvAddr[0] = t0; PasvAddr[1] = t1; PasvAddr[2] = t2; PasvAddr[3] = t3;
+
+  if ( (t0 != FtpServerAddr[0]) || (t1 != FtpServerAddr[1]) || (t2 != FtpServerAddr[2]) || (t3 != FtpServerAddr[3]) ) {
+    puts( "Warning: Found a third party address on the PASV response.  Ignoring it." );
+  }
+
+  Ip::copy( PasvAddr, FtpServerAddr );
   PasvPort = (t4<<8) + t5;
 
   return 0;
@@ -1790,31 +1719,32 @@ void sendPortCommand( ) {
 }
 
 void sendListCommand( char *cmd ) {
-  char outBuf[ SERVERFILE_MAX_LEN + 10 ];
+  char outBuf[ FILESPEC_MAX_LEN + 10 ];
   int bytes;
-  if ( *DirParm == 0 ) {
+  if ( *ServerFile == 0 ) {
     bytes = sprintf( outBuf, "%s" _NL_, cmd );
   }
   else {
-    bytes = sprintf( outBuf, "%s %s" _NL_, cmd, DirParm );
+    bytes = sprintf( outBuf, "%s %s" _NL_, cmd, ServerFile );
   }
   ControlSocket->send( (uint8_t *)outBuf, bytes );
 }
 
 
 void sendRetrCommand( void ) {
-  char tmp[ SERVERFILE_MAX_LEN + 10 ];
+  char tmp[ FILESPEC_MAX_LEN + 10 ];
   int bytes = sprintf( tmp, "RETR %s" _NL_, ServerFile );
   ControlSocket->send( (uint8_t *)tmp, bytes );
 }
 
 void sendStorCommand( void ) {
 
-  // Did they provide a different name for the server?  If so use it.
+  // Assume the name of the server is the same as the name on our side,
+  // but if they provided a server side name use it.
   char *filename = LocalFile;
   if ( *ServerFile != 0 ) filename = ServerFile;
 
-  char tmp[ SERVERFILE_MAX_LEN + 10 ];
+  char tmp[ FILESPEC_MAX_LEN + 10 ];
   int bytes = sprintf( tmp, "STOR %s" _NL_, filename );
   ControlSocket->send( (uint8_t *)tmp, bytes );
 }
@@ -1842,8 +1772,9 @@ void doNlst( void ) {
 }
 
 
-// DoGet doesn't actually use ServerFile and LocalFile, but if they
-// are not set before you call this you are going to be hosed.
+// doGet and doPut expect ServerFile and LocalFile to be set by this point.
+// If they are not you will blow up later when trying to open the file to
+// send or receive it.
 
 void doGet( void ) {
 
@@ -1868,9 +1799,6 @@ void doGet( void ) {
   }
 }
 
-
-// DoPut doesn't actually use ServerFile and LocalFile, but if they
-// are not set before you call this you are going to be hosed.
 
 void doPut( void ) {
 
@@ -1917,7 +1845,7 @@ int8_t driveLoopUntilCmdLine( ) {
     }
 
     if ( CtrlBreakDetected ) {
-      puts( "\nCtrl-Break detected - cleaning up to go to command state.\n" );
+      puts( CtrlBreakCmdState_msg );
       CtrlBreakDetected = 0;
       closeDataSockets( );
       ClientState = CmdLine;
@@ -1939,7 +1867,7 @@ int8_t driveLoopUntilCmdLine( ) {
 
 int8_t promptMgetMput( char *cmd ) {
 
-  if ( MgetMputPrompt == 0 ) return 0;
+  if ( !MgetMputPrompt ) return 0;
 
   while ( 1 ) {
 
@@ -1977,28 +1905,21 @@ int8_t promptMgetMput( char *cmd ) {
 
 void doMput( char *filespec ) {
 
-  // Arg is the filespec to use.
+  // First build up the list of files to be transferred.
 
   mListIndex = mList;
 
-  #if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-  #define MPUT_FILENAME_FIELD name
   struct find_t fileinfo;
   int done = _dos_findfirst( filespec, _A_NORMAL, &fileinfo);
-  #else
-  #define MPUT_FILENAME_FIELD ff_name
-  struct ffblk fileinfo;
-  int done = findfirst( filespec, &fileinfo, 0);
-  #endif
 
   while (!done) {
 
-    uint8_t len = strlen( fileinfo.MPUT_FILENAME_FIELD );
+    uint16_t len = strlen( fileinfo.name );
 
     // Make sure we are not going past the end of our allocation
     if ( mListIndex + len + 1 < mList + mListBufSize ) {
-      strcpy( mListIndex, fileinfo.MPUT_FILENAME_FIELD );
-      mListIndex = mListIndex + strlen( fileinfo.MPUT_FILENAME_FIELD ) + 1;
+      strcpy( mListIndex, fileinfo.name );
+      mListIndex = mListIndex + strlen( fileinfo.name ) + 1;
       done = findnext( &fileinfo );
     }
     else {
@@ -2009,7 +1930,7 @@ void doMput( char *filespec ) {
   }
 
   if ( mListIndex == mList ) {
-    puts( "No names on this machine matched." );
+    puts( NoMatches_msg );
     return;
   }
 
@@ -2044,11 +1965,12 @@ void doMput( char *filespec ) {
 }
 
 
-void doMget( char *filespec ) {
 
-  strcpy( DirParm, filespec );
+int16_t fetchFilelistFromServer( const char *filespec ) {
 
-  ReadingForMget = 1;
+  strcpy( ServerFile, filespec );
+
+  ReadingForMget = true;
 
   mListIndex = mList;
   mListIndex[0] = 0;
@@ -2056,13 +1978,21 @@ void doMget( char *filespec ) {
 
   // Need to wait for the results of the NLST to come back.
   doNlst( );
-  if ( driveLoopUntilCmdLine( ) ) return;
-
+  if ( driveLoopUntilCmdLine( ) ) return -1;
   
   if ( mListIndex == mList ) {
-    puts( "No names on the remote server matched." );
-    return;
+    puts( NoMatches_msg );
+    return -1;
   }
+
+  return 0;
+}
+
+
+void doMget( char *filespec ) {
+
+  // Get the list of files to transfer from the server using an NLST command.
+  if ( fetchFilelistFromServer( filespec ) ) return;
 
 
   // ServerFile will be updated each time through the loop.
@@ -2103,9 +2033,44 @@ void doMget( char *filespec ) {
   } // end while
 
   if ( skippedFiles ) {
-    printf( "Warning: %d files were skipped because they had invalid DOS filenames.\n",
+    printf( "\nWarning: %d files were skipped because they had invalid DOS filenames.\n",
             skippedFiles );
   }
+
+}
+
+
+void doMdelete( char *filespec ) {
+
+  // Get the list of files to delete from the server using an NLST command.
+  if ( fetchFilelistFromServer( filespec ) ) return;
+
+
+  // ServerFile will be updated each time through the loop.
+  // LocalFile will only be used if the incoming filename
+  // has an invalid character, length or format.
+
+  int skippedFiles = 0;
+
+  char *i = mList;
+
+  while ( i < mListIndex ) {
+
+    printf( "\nMDELETE: deleting %s\n", i );
+
+    int rc = promptMgetMput( "Delete" );
+
+    if ( rc == 0 || rc == 1 ) {
+      processSimpleUserCmd( "DELE", i );
+      if ( driveLoopUntilCmdLine( ) ) break;
+    }
+    else if ( rc == 3 || rc == 4 ) {
+      break;
+    }
+
+    i = i + strlen(i) + 1;
+
+  } // end while
 
 }
 
@@ -2125,7 +2090,7 @@ int8_t listenForDataSocket( void ) {
   TRACE(( "Opening listening socket on port %u\n", DataPort ));
 
   // Open for listening - should return right back.
-  int8_t rc = ListenSocket->listen( DataPort, DataRecvSize );
+  int8_t rc = ListenSocket->listen( DataPort, TcpRecvSize );
   if ( rc ) {
     printf( "Error opening listening socket for incoming data (%d)\n", rc );
     TRACE(( "Error opening listening socket on port %u\n", DataPort ));
@@ -2190,9 +2155,9 @@ int8_t connectDataSocket( void ) {
   // Should never fail
   DataSocket = TcpSocketMgr::getSocket( );
 
-  int8_t rc = DataSocket->setRecvBuffer( DataRecvSize );
+  int8_t rc = DataSocket->setRecvBuffer( TcpRecvSize );
   if ( rc ) {
-    puts( "Not enough free memory" );
+    puts( NotEnoughMemory_msg );
     closeAndFreeDataSocket( );
     return -1;
   }
@@ -2279,8 +2244,7 @@ int8_t readFileList( void ) {
 
     int bytesRead;
 
-    uint16_t fileBufSize = (RecvFileBufSize > SendFileBufSize) ? RecvFileBufSize : SendFileBufSize;
-    while ( bytesRead = DataSocket->recv( FileBuffer, fileBufSize-1 ) ) {
+    while ( bytesRead = DataSocket->recv( FileBuffer, FileBufSize-1 ) ) {
 
       if ( bytesRead < 0 ) {
         done = 3;
@@ -2326,7 +2290,7 @@ int8_t readFileList( void ) {
               lineStart = i+1;
 
               if ( lines >= ScreenPager ) {
-                printf( "Press a key to continue ..." );
+                printf( PressAKey_msg );
                 fflush( stdout );
 
                 while ( bioskey(1) == 0 ) {
@@ -2482,7 +2446,7 @@ int8_t receiveFile( void ) {
   uint32_t totalBytesReceived = 0;
 
   uint16_t bytesRead = 0;
-  uint16_t bytesToRead = RecvFileBufSize;
+  uint16_t bytesToRead = FileBufSize;
 
   int x = wherex( );
   int y = wherey( );
@@ -2524,12 +2488,13 @@ int8_t receiveFile( void ) {
             done = 3;
           }
           //write( fd, FileBuffer, bytesRead );
-          bytesToRead = RecvFileBufSize;
+          bytesToRead = FileBufSize;
           bytesRead = 0;
 
           if ( !IsStdoutFile ) {
             if ( update == 0 ) {
-              myCprintf( x, y, "Bytes transferred: %lu", totalBytesReceived );
+              gotoxy( x, y );
+              cprintf( BytesTransferred_fmt, totalBytesReceived );
             }
             update = (update + 1) & 0x03;
           }
@@ -2566,7 +2531,7 @@ int8_t receiveFile( void ) {
       break;
     }
     case 2: {
-      printf( "Data socket closed early - close reason: %d\n", DataSocket->getCloseReason( ) );
+      printf( DataSocketClosed_fmt, DataSocket->getCloseReason( ) );
       break;
     }
 
@@ -2576,7 +2541,7 @@ int8_t receiveFile( void ) {
     }
 
     case 4: {
-      puts( "Xfer aborted due to Ctrl-Break" );
+      puts( XferAborted_msg );
       break;
     }
 
@@ -2626,7 +2591,7 @@ int8_t sendFile( void ) {
   }
 
   // Set a large buffer for the C runtime.
-  setvbuf( sourceFile, (char *)FileBuffer, _IOFBF, SendFileBufSize );
+  setvbuf( sourceFile, (char *)FileBuffer, _IOFBF, FileBufSize );
 
   clockTicks_t startTicks = TIMER_GET_CURRENT( );
 
@@ -2755,7 +2720,8 @@ int8_t sendFile( void ) {
 
       if ( !IsStdoutFile ) {
         if ( update == 0 ) {
-          myCprintf( x, y, "Bytes transferred: %lu", totalBytesSent );
+          gotoxy( x, y );
+          cprintf( BytesTransferred_fmt, totalBytesSent );
         }
         update = (update + 1) & 0x0F;
       }
@@ -2826,10 +2792,10 @@ int8_t sendFile( void ) {
   gotoxy( x, y );
 
   if ( done == 2 ) {
-    printf( "Data socket closed early - close reason: %d\n", DataSocket->getCloseReason( ) );
+    printf( DataSocketClosed_fmt, DataSocket->getCloseReason( ) );
   }
   else if ( done == 3 ) {
-    puts( "Xfer aborted due to Ctrl-Break" );
+    puts( XferAborted_msg );
   }
   else if ( done == 4 ) {
     puts( "Xfer aborted due to filesystem error" );
@@ -2870,49 +2836,79 @@ char *current_directory(char *path) {
 
 
 
-char DosChars[] = "!@#$%^&()-_{}`'~";
+/* Ye olde way ...
 
-uint8_t isValidDosChar( char c ) {
+   char DosChars[] = "!@#$%^&()-_{}`'~";
 
-  if ( isalnum( c ) || (c>127) ) return 1;
+   bool isValidDosChar( char c ) {
 
-  for ( uint8_t i=0; i < 16; i++ ) {
-    if ( c == DosChars[i] ) return 1;
-  }
+     if ( isalnum( c ) || (c>127) ) return true;
 
-  return 0;
+     for ( uint16_t i=0; i < 16; i++ ) {
+       if ( c == DosChars[i] ) return true;
+     }
+
+     return false;
+   }
+
+
+   Ye better way - a pre-computed table that just reduces isValidDosChar
+   to a byte read from a table and some bit shifting.
+
+   Here is the code to generate the table:
+
+   for ( int i=0; i < 256; i++ ) {
+     if ( isValidDosChar(i) ) {
+       int mapByte = i / 8;
+       int mapBit = i % 8;
+       map[mapByte] = map[mapByte] | (1<<mapBit);
+     }
+   }
+
+*/
+
+static uint8_t DosCharMap[] = {
+  0x00, 0x00, 0x00, 0x00, 0xFA, 0x23, 0xFF, 0x03,
+  0xFF, 0xFF, 0xFF, 0xC7, 0xFF, 0xFF, 0xFF, 0x6F,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+inline bool isValidDosChar( char c ) {
+  return ( DosCharMap[c>>3] & (1 << (c & 0x7)) );
 }
 
 
-uint8_t isValidDosFilename( const char *filename ) {
 
-  if (filename==NULL) return 0;
+bool isValidDosFilename( const char *filename ) {
 
-  uint8_t len = strlen(filename);
+  if (filename==NULL) return false;
 
-  if ( len == 0 ) return 0;
+  uint16_t len = strlen(filename);
 
-  if ( !isValidDosChar( filename[0] ) ) return 0;
+  if ( len == 0 ) return false;
 
-  uint8_t i;
+  if ( !isValidDosChar( filename[0] ) ) return false;
+
+  uint16_t i;
   for ( i=1; (i<8) && (i<len) ; i++ ) {
     if ( filename[i] == '.' ) break;
-    if ( !isValidDosChar( filename[i] ) ) return 0;
+    if ( !isValidDosChar( filename[i] ) ) return false;
   }
 
-  if ( i == len ) return 1;
+  if ( i == len ) return true;
 
-  if ( filename[i] != '.' ) return 0;
+  if ( filename[i] != '.' ) return false;
 
   i++;
-  uint8_t j;
+  uint16_t j;
   for ( j=0; (j+i) < len; j++ ) {
-    if ( !isValidDosChar( filename[j+i] ) ) return 0;
+    if ( !isValidDosChar( filename[j+i] ) ) return false;
   }
 
-  if ( j > 3 ) return 0;
+  if ( j > 3 ) return false;
 
-  return 1;
+  return true;
 }
 
 
@@ -2985,7 +2981,7 @@ void probeStdinStdout( void ) {
 
   if ( outregs.x.cflag == 0 ) {
     if ( (outregs.x.dx & 0x0080) == 0 ) {
-      IsStdinFile = 1;
+      IsStdinFile = true;
     }
   }
 
@@ -2994,7 +2990,7 @@ void probeStdinStdout( void ) {
 
   if ( outregs.x.cflag == 0 ) {
     if ( (outregs.x.dx & 0x0080) == 0 ) {
-      IsStdoutFile = 1;
+      IsStdoutFile = true;
     }
   }
 
@@ -3011,7 +3007,7 @@ void probeStdinStdout( void ) {
 
 int readStdin( char *buffer, int bufLen ) {
 
-  uint8_t bufferIndex = 0;
+  uint16_t bufferIndex = 0;
 
   while ( 1 ) {
 
@@ -3063,16 +3059,24 @@ void drawCursor( int startX, int startY, int offset ) {
 }
 
 
-void clearInputArea( int startX, int startY, int offset, bool spanningTwoLines ) {
-  bool startLine = 0;
-  startX = startX + offset;
-  if ( startX > (ScreenCols-1) ) {
-    startX = startX - ScreenCols;
-    startY++;
-    startLine++;
+void clearInputArea( int startX, int startY, bool spanningTwoLines ) {
+
+  gotoxy( startX, startY );
+
+  // Write enough to blank out the line without causing scrolling.
+  int chars = ScreenCols - 1 - startX;
+  if ( spanningTwoLines ) chars = chars + ScreenCols;
+
+  while (chars) {
+    if (chars > 40) {
+      cputs( Spaces );
+      chars = chars - 40;
+    } else {
+      cputs( Spaces + (40-chars) );
+      chars = 0;
+    }
   }
-  clrLine( startX, startY );
-  if ( (startLine == 0) && (spanningTwoLines == true) ) clrLine( 0, startY+1 );
+
 }
 
 
@@ -3085,16 +3089,21 @@ void clearInputArea( int startX, int startY, int offset, bool spanningTwoLines )
 // Returns 0 if everything is normal
 // Returns -1 if the user hits Ctrl-Break or Ctrl-C
 
-int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
+int readConsole( char *buffer, int bufLen, bool enableCmdEdit ) {
 
   fflush( stdout );
 
-  int insertMode = 1;
+  bool insertMode = true;
 
   int recallOffset = 0;
 
-  uint8_t bufferLen = 0;   // How many chars are in the buffer
-  uint8_t bufferIdx = 0;   // Current cursor position in the buffer for editing
+  uint16_t bufferLen = 0;   // How many chars are in the buffer
+  uint16_t bufferIdx = 0;   // Current cursor position in the buffer for editing
+
+  // User reported bug: zero the buffer because the server or TCP/IP can break
+  // out of this routine, and without the buffer zeroed it would look like the
+  // user entered the previous input again.
+  *buffer = 0;
 
 
   // Remember the row and column that we start at so that we can preserve the prompt.
@@ -3136,7 +3145,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
         // Function key
         uint8_t fkey = key >> 8;
 
-        if ( enableCmdEdit == 0 ) {
+        if ( !enableCmdEdit ) {
           // Sleazy, but effective - supress command editing
           fkey = 0;
         }
@@ -3165,7 +3174,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
             bufferLen = strlen( buffer );
             bufferIdx = bufferLen;
 
-            clearInputArea( startX, startY, 0, spanningTwoLines );
+            clearInputArea( startX, startY, spanningTwoLines );
             gotoxy( startX, startY );
             cputs( buffer );
 
@@ -3203,7 +3212,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
             bufferLen = strlen( buffer );
             bufferIdx = bufferLen;
 
-            clearInputArea( startX, startY, 0, spanningTwoLines );
+            clearInputArea( startX, startY, spanningTwoLines );
             gotoxy( startX, startY );
             cputs( buffer );
 
@@ -3256,7 +3265,8 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
               // Update only the part we need to
               drawCursor( startX, startY, bufferIdx );
               cputs( buffer + bufferIdx );
-              clearInputArea( startX, startY, bufferLen, spanningTwoLines );
+              putch( ' ' );
+	      gotoxy( startX, startY );
 
             }
             else {
@@ -3299,7 +3309,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
           // Wipe out the current input
           bufferIdx = bufferLen = 0;
           buffer[ 0 ] = 0;
-          clearInputArea( startX, startY, 0, spanningTwoLines );
+          clearInputArea( startX, startY, spanningTwoLines );
           gotoxy( startX, startY );
         }
 
@@ -3408,7 +3418,7 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
 
               drawCursor( startX, startY, bufferIdx );
               cputs( buffer + bufferIdx );
-              clearInputArea( startX, startY, bufferLen, spanningTwoLines );
+              putch( ' ' );
               drawCursor( startX, startY, bufferIdx );
             }
 
@@ -3452,34 +3462,4 @@ int readConsole( char *buffer, int bufLen, int enableCmdEdit ) {
   return 0;
 }
 
-
-
-/*
-
-// Returns 0 - no way to sense EOF
-
-int msdosRead( char *buffer, int bufLen ) {
-
-  buffer[0] = bufLen - 3;
-
-  union REGS regs;
-  struct SREGS sregs;
-
-  regs.h.ah = 0x0a;
-  sregs.ds = FP_SEG( buffer );
-  regs.x.dx = FP_OFF( buffer );
-
-  intdosx(&regs, &regs, &sregs);
-
-  uint8_t bufferLen = buffer[1];
-  buffer[ bufferLen + 2 ] = 0;
-
-  memmove( buffer, buffer+2, bufferLen+1 );
-
-  puts( "" );
-
-  return 0;
-}
-
-*/
 

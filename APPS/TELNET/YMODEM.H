@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ymodem.h
-   Copyright (C) 2012-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2012-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -39,7 +38,10 @@
 #define _YMODEM_H
 
 
+#include <time.h>
+
 #include "types.h"
+#include "timer.h"
 #include "keys.h"
 
 

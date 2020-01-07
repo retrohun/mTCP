@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Tcp.H
-   Copyright (C) 2006-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -30,6 +29,10 @@
    2011-05-27: Initial release as open source software
    2013-02-17: Improved timeout and retransmit support
    2013-03-28: Add a method to see if a socket has waiting data
+   2014-05-18: Code cleanup: get rid of socket level forcePureAck and
+               forceProbe flags and replace with TcpBuffer level
+               versions; remove dead inUse flag; add two more counters;
+               add static asserts for configuration options
 
 */
 
@@ -39,9 +42,22 @@
 #define _TCP_H
 
 
-#include CFG_H
 
+// Load and check the configuration options
+
+#include CFG_H
 #include "types.h"
+
+static_assert( TCP_MAX_SOCKETS > 0 );
+static_assert( TCP_MAX_SOCKETS <= 64 );        // Sockets are around 210 bytes
+static_assert( TCP_MAX_XMIT_BUFS > 0 );
+static_assert( TCP_MAX_XMIT_BUFS <= 40 );      // Limited by malloc
+static_assert( TCP_CLOSE_TIMEOUT >= 5000ul );
+
+
+
+// Continue with other includes
+
 #include "eth.h"
 #include "ip.h"
 #include "ringbuf.h"
@@ -172,11 +188,34 @@ class TcpBuffer {
     clockTicks_t overdueAt;   // Timestamp after which we need to try again
     uint8_t      attempts;    // Number of send attempts after ARP is resolved
     uint8_t      pendingArp;  // Are we just waiting for arp?
-    uint8_t      pureAck;     // Was this a pure ack packet only?
     uint8_t      rc;          // Final result code
-    uint8_t      inUse;       // On when enqueued, off when acked
     uint8_t      bufferPool;  // Is this part of the pool for a socket?
+    uint16_t     flags;       // Misc flags; see getters/setters below
     TcpPacket_t  headers;     // Start of the actual packet data.
+
+
+    // If a packet was sent and it had no data and only an ACK flag, it is
+    // an ACK only or pure ACK packet.  We need to know when this happens
+    // so that we don't put it on the sent queue for a socket and wait for
+    // the other side to ack it.  (It won't.)
+
+    inline bool wasAckOnly( void )        { return ((flags & 0x01) == 0x01); }
+    inline void setWasAckOnly( void )     { flags = flags | 0x01; }
+
+
+    // These two flags are only set inside sendPureAck.  ForceAckOnly will
+    // ensure that no other flag bits get set on the packet.  This is used
+    // when we get a packet with a bad sequence or acknowledgement number.
+    // ForceProbe will cause us to set a slightly invalid sequence number
+    // which should elicit an ACK packet from the other side.  We do not need
+    // clear methods because these flags get reset every time this particular
+    // magic packet is used.
+
+    inline bool isForceAckOnly( void )    { return ((flags & 0x80) == 0x80); }
+    inline void setForceAckOnly( void )   { flags = flags | 0x80; }
+
+    inline bool isForceProbe( void )      { return ((flags & 0x40) == 0x40); }
+    inline void setForceProbe( void )     { flags = flags | 0x40; }
 
 
     // Buffer pool management
@@ -280,8 +319,6 @@ class TcpSocket {
     uint8_t  state;            // One of the TCP Socket states above
     uint8_t  disableReads;     // Set if user calls shutdown( shut_rd )
     uint8_t  pendingAccept;    // Is this created by Listen and still pending accept?
-    uint8_t  forcePureAck;     // Used to force a pure ack path on error path
-    uint8_t  forceProbe;       // Used with above to send a probe segment
 
     uint8_t  closeReason;      // Under what circumstances did this close
                                //  0 is normal close
@@ -336,6 +373,12 @@ class TcpSocket {
     uint16_t RTT_deviation;  // Deviation ( units are clock ticks )
 
 
+    // Experimental: used to shrink the receive window on bad connections.
+    uint8_t  consecutiveGoodPackets;
+    uint8_t  consecutiveSeqErrs;
+    bool     reportSmallWindow;
+    bool     padding01;
+
   public:
 
     // User Interface
@@ -348,7 +391,9 @@ class TcpSocket {
     int8_t connectNonBlocking( uint16_t srcPort_p, IpAddr_t host_p, uint16_t dstPort_p );
     int8_t isConnectComplete( void ) { return ( (state == TCP_STATE_ESTABLISHED) || (state == TCP_STATE_CLOSE_WAIT) ); };
 
+    #ifdef TCP_LISTEN_CODE
     int8_t listen( uint16_t srcPort_p, uint16_t recvBufferSize );
+    #endif
 
     int8_t shutdown( uint8_t how );
 
@@ -385,6 +430,7 @@ class TcpSocket {
       if ( (incoming.entries > 0) || (rcvBufEntries > 0) ) return true; else return false;
     }
 
+    inline bool outgoingQueueIsFull( void ) { return !outgoing.hasRoom( ); }
 
     // Almost should be private: alternative to send
     int16_t enqueue( TcpBuffer *buf );    // Send data
@@ -407,7 +453,7 @@ class TcpSocket {
 
     int8_t near sendPacket( TcpBuffer *buf );
     void   near resendPacket( TcpBuffer *buf );
-    void   near sendPureAck( void );
+    void   near sendPureAck( bool forceProbe = false );
 
     void   near processSyn( IpHeader *ip, TcpHeader *tcp, uint32_t incomingSeqNum );
 
@@ -445,6 +491,9 @@ class Tcp {
     static uint32_t Packets_Retransmitted;
     static uint32_t Packets_SeqOrAckError;
     static uint32_t Packets_DroppedNoSpace;
+    static uint32_t ChecksumErrors;
+    static uint32_t OurWindowReopened;
+    static uint32_t SentZeroWindowProbe;
 
     static uint16_t Pending_Sent;
     static uint16_t Pending_Outgoing;

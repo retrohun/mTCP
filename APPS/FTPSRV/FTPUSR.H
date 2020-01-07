@@ -2,7 +2,7 @@
 /*
 
    mTCP FtpUsr.h
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -35,8 +35,7 @@
 #ifndef _FTP_USER_H
 #define _FTP_USER_H
 
-#include "types.h"
-#include "ftpsrv.cfg"
+#include "ftpsrv.h"
 
 
 class FtpUser {

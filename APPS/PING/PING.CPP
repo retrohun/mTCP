@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ping.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -28,6 +27,8 @@
 
    2012-04-29: Fix a small bug; outgoing packets were too large
    2011-05-27: Initial release as open source software
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
+   2015-02-03: Code cleanup
 
 */
 
@@ -43,17 +44,14 @@
 // code processor dependent delay loops, which don't work anyway.
 
 
+#include <conio.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#ifndef __TURBOC__
-#include <conio.h>
-#endif
-
 #include "types.h"
-
+#include "trace.h"
 #include "utils.h"
 #include "packet.h"
 #include "arp.h"
@@ -63,17 +61,7 @@
 
 
 
-#define SERVER_ADDR_NAME_LEN (80)
-
-
-
-// Bump Turbo C++'s standard stack
-// extern uint16_t _stklen = 4096l;
-
-
-
-
-char     ServerAddrName[ SERVER_ADDR_NAME_LEN ];
+char    *ServerName;
 IpAddr_t ServerAddr;
 uint16_t PacketCount = 4;
 uint16_t PacketPayload = 32;
@@ -88,25 +76,16 @@ uint32_t ReplyTime = 0;
 uint16_t icmpLen;
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
-//
-// Check this flag once in a while to see if the user wants out.
+
+
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
+
 volatile uint8_t CtrlBreakDetected = 0;
-
-#ifdef __TURBOC__
-void interrupt ( *oldCtrlBreakHandler)( ... );
-
-void interrupt ctrlBreakHandler( ... ) {
-  CtrlBreakDetected = 1;
-}
-#else
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
-#endif
 
 
 
@@ -127,28 +106,8 @@ void shutdown( int rc );
 
 
 volatile uint32_t ping_ticks2 = 0;
-volatile uint8_t ping_ticks = 0;
+volatile uint16_t ping_ticks = 0;
 
-
-#ifdef __TURBOC__
-
-void interrupt ( *ping_old_tick_handler)( ... );
-
-void interrupt ping_tick_handler( ... )
-{
-  ping_ticks2++;
-
-  ping_ticks++;
-  if ( ping_ticks == 63 ) {
-    ping_ticks = 0;
-    ping_old_tick_handler( );
-  }
-  else {
-    outportb( 0x20, 0x20 );
-  }
-}
-
-#else
 
 void ( __interrupt __far *ping_old_tick_handler)( );
 
@@ -166,33 +125,19 @@ void __interrupt __far ping_tick_handler( )
   }
 }
 
-#endif
-
 
 
 void ping_hook( void ) {
 
   disable_ints( );
 
-  // Turn off NMI
-  // asm in al, 0xa0;
-  // asm mov al, 0x00;
-  // asm out 0xa0, al;
-
-
   ping_old_tick_handler = getvect( 0x08 );
   setvect( 0x08, ping_tick_handler );
 
-  #ifdef __TURBOC__
-
-  asm mov al, 0x36; // Timer 0 Mode 3
-  asm out 0x43, al;
-  asm mov al, 0x00;
-  asm out 0x40, al;
-  asm mov al, 0x04;
-  asm out 0x40, al;
-
-  #else
+  // Tell the 8253 that we want to use Mode 3 on timer 0.
+  // The counter will start at 0x400 and count down to 0
+  // instead of the usual 0xFFFF, which makes it 64 times
+  // faster than usual.
 
   _asm {
     mov al, 0x36
@@ -203,38 +148,12 @@ void ping_hook( void ) {
     out 0x40, al
   }
 
-  #endif
-
-    
-
-
-  // Reenable NMI
-  // asm in al, 0xa0;
-  // asm mov al, 0x80;
-  // asm out 0xa0, al;
-
   enable_ints( );
 }
 
 void ping_unhook( void ) {
 
   disable_ints( );
-
-  // Turn off NMI
-  // asm in al, 0xa0;
-  // asm mov al, 0x00;
-  // asm out 0xa0, al;
-
-  #ifdef __TURBOC__
-
-  asm mov al, 0x36; // Timer 0 Mode 3
-  asm out 0x43, al;
-  asm mov al, 0xFF;
-  asm out 0x40, al;
-  asm mov al, 0xFF;
-  asm out 0x40, al;
-
-  #else
 
   _asm {
     mov al, 0x36
@@ -245,29 +164,20 @@ void ping_unhook( void ) {
     out 0x40, al
   }
 
-  #endif
-
-
   setvect( 0x08, ping_old_tick_handler );
-
-
-  // Reenable NMI
-  // asm in al, 0xa0;
-  // asm mov al, 0x80;
-  // asm out 0xa0, al;
 
   enable_ints( );
 }
 
 
 
-static char CopyrightMsg1[] = "mTCP Ping by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2013\n";
-static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
+
+static char *CopyrightMsg= "\nmTCP Ping by M Brutman (mbbrutman@gmail.com) (C)opyright 2009-2020\nVersion: " __DATE__ "\n";
 
 
 int main( int argc, char *argv[] ) {
 
-  printf( "%s  %s", CopyrightMsg1, CopyrightMsg2 );
+  puts( CopyrightMsg );
 
   parseArgs( argc, argv );
 
@@ -279,64 +189,42 @@ int main( int argc, char *argv[] ) {
 
 
   // No sockets, no buffers TCP buffers
-  if ( Utils::initStack( 0, 0 ) ) {
+  if ( Utils::initStack( 0, 0, ctrlBreakHandler, ctrlBreakHandler ) ) {
     puts( "\nFailed to initialize TCP/IP - exiting" );
     exit( 1 );
   }
 
 
-  // From this point forward you have to call the shutdown( ) routine to
-  // exit because we have the timer interrupt hooked.
-
-  // Save off the old Ctrl-Break handler and enable our own.  Shutdown( )
-  // will restore the old handler for us.  Set the Ctrl-C handler to be the
-  // same routine, but don't worry about restoring it - DOS will do that
-  // for us.
-
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-  setvect( 0x23, ctrlBreakHandler);
-
-
-
+  // Hook the timer interrupt to reprogram it for higher precision.  This will
+  // not affect the rate at which the BIOS tick happens.
 
   ping_hook( );
 
 
+  // From this point forward you have to call the shutdown( ) routine to
+  // exit because we have the timer interrupt hooked.  It is actually hooked
+  // twice; once by TCP/IP and then by this code.
 
-  // Resolve the name and definitely send the request
-  int8_t rc = Dns::resolve( ServerAddrName, ServerAddr, 1 );
-  if ( rc < 0 ) {
-    puts( "Error resolving server" );
-    shutdown( 1 );
-  }
 
-  uint8_t done = 0;
+  // Start resolving the name.
+  Dns::resolve( ServerName, ServerAddr, 1 );
 
-  while ( !done ) {
-
-    if ( CtrlBreakDetected ) {
-      break;
-    }
-
-    if ( !Dns::isQueryPending( ) ) break;
-
+  while ( !CtrlBreakDetected && Dns::isQueryPending( ) ) {
     PACKET_PROCESS_SINGLE;
     Arp::driveArp( );
     Dns::drivePendingQuery( );
-
   }
 
-  // Query is no longer pending or we bailed out of the loop.
-  rc = Dns::resolve( ServerAddrName, ServerAddr, 0 );
 
-  if ( rc != 0 ) {
-    puts( "Error resolving server" );
+  // Query is no longer pending or we bailed out of the loop.
+  if ( Dns::resolve( ServerName, ServerAddr, 0 ) != 0 ) {
+    printf( "Error resolving server name: %s\n", ServerName );
     shutdown( 1 );
   }
 
-  if ( ServerAddr[0] == 127 ) {
-    puts( "Loopback addresses not supported" );
+
+  if ( Ip::isSame( ServerAddr, MyIpAddr ) || (ServerAddr[0] == 127) ) {
+    puts( "Pinging your own address or loopback addresses is not supported." );
     shutdown( 1 );
   }
 
@@ -366,7 +254,7 @@ int main( int argc, char *argv[] ) {
 
   // Icmp data
 
-  icmpEchoPacket.ident = htons( 0x4860 );
+  icmpEchoPacket.ident = 0x6048; // Will be 4860 when transmitted; the PCjr model number
   icmpEchoPacket.seq = 0;
 
   for ( int i=0; i < PacketPayload; i++ ) {
@@ -381,7 +269,7 @@ int main( int argc, char *argv[] ) {
 
   // Eth header dest - has to be called after Ip header is set.
   // Should return a 1 the first time because we haven't ARPed yet.
-  int8_t arpRc = icmpEchoPacket.ip.setDestEth( &icmpEchoPacket.eh.dest );
+  int8_t arpRc = icmpEchoPacket.ip.setDestEth( icmpEchoPacket.eh.dest );
 
 
 
@@ -398,13 +286,12 @@ int main( int argc, char *argv[] ) {
     PACKET_PROCESS_SINGLE;
     Arp::driveArp( );
 
-    arpRc = icmpEchoPacket.ip.setDestEth( &icmpEchoPacket.eh.dest );
+    arpRc = icmpEchoPacket.ip.setDestEth( icmpEchoPacket.eh.dest );
 
   }
 
   if ( arpRc ) {
-    TRACE_WARN(( "Ping: Timeout waiting for ARP response.\n" ));
-    puts( "Timeout waiting for ARP response" );
+    puts( "Timeout waiting for ARP response." );
     shutdown( 1 );
   }
 
@@ -465,7 +352,7 @@ void icmpHandler( const unsigned char *packet, const IcmpHeader *icmp ) {
 
     IcmpEchoPacket_t *icmpReply = (IcmpEchoPacket_t *)packet;
 
-    if ( icmpReply->ident == htons(0x4860) && icmpReply->seq == icmpEchoPacket.seq ) {
+    if ( icmpReply->ident == 0x6048 && icmpReply->seq == icmpEchoPacket.seq ) {
 
       // More checks ..
 
@@ -509,7 +396,7 @@ void sendAndWait( ) {
 
       // float elapsed = elapsedTicks * 0.858209;
       uint16_t elapsedMs = (elapsedTicks * 85) / 100;
-      uint8_t elapsedSmall = (elapsedTicks * 85) % 100;
+      uint16_t elapsedSmall = (elapsedTicks * 85) % 100;
 
       printf( "Packet sequence number %u received in %u.%02u ms, ttl=%u\n", ntohs( icmpEchoPacket.seq ), elapsedMs, elapsedSmall, LastTTL );
       RepliesReceived++;
@@ -543,27 +430,13 @@ void sendAndWait( ) {
 
 
 
-
-char *HelpText[] = {
-  "\nping [options] <ipaddr>\n",
-  "Options:",
-  "  -help        Shows this help",
-  "  -count <n>   Number of packets to send, default is 4",
-  "  -size <n>    Size of ICMP payload to send, default is 32",
-  "  -timeout <n> Number of seconds between pings",
-  NULL
-};
-
-
-
-
-
 void usage( void ) {
-  uint8_t i=0;
-  while ( HelpText[i] != NULL ) {
-    puts( HelpText[i] );
-    i++;
-  }
+  puts( "\nping [options] <ipaddr>\n\n"
+        "Options:\n"
+        "  -help        Shows this help\n"
+        "  -count <n>   Number of packets to send, default is 4\n"
+        "  -size <n>    Size of ICMP payload to send, default is 32\n"
+        "  -timeout <n> Number of seconds to wait for a response packet" );
   exit( 1 );
 }
 
@@ -612,19 +485,18 @@ void parseArgs( int argc, char *argv[] ) {
       }
     }
     else {
-      printf( "Unknown option %s\n", argv[i] );
+      printf( "Unknown option: %s\n", argv[i] );
       usage( );
     }
 
   }
 
   if ( i == argc ) {
-    puts( "You need to specify a machine name or IP address" );
+    puts( "A machine name or IP address is required." );
     usage( );
   }
 
-  strncpy( ServerAddrName, argv[i], SERVER_ADDR_NAME_LEN );
-  ServerAddrName[ SERVER_ADDR_NAME_LEN - 1 ] = 0;
+  ServerName = argv[i];
 
 }
 
@@ -633,13 +505,7 @@ void parseArgs( int argc, char *argv[] ) {
 
 
 void shutdown( int rc ) {
-
   ping_unhook( );
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-  // Utils::dumpStats( stderr );
-  fclose( TrcStream );
   exit( rc );
 }

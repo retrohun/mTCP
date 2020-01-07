@@ -2,7 +2,7 @@
 /*
 
    mTCP Screen.cpp
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -44,6 +44,7 @@
 #include <mem.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdlib.h>
 #include <utils.h>
 
 #include "screen.h"
@@ -56,6 +57,8 @@
 uint8_t far *Screen::screenBase;
 uint8_t far *Screen::separatorRowAddr;
 uint8_t far *Screen::inputAreaStart;
+
+uint16_t Screen::screenBaseSeg;
 
 uint16_t Screen::screenRows;
 uint16_t Screen::screenCols;
@@ -73,15 +76,7 @@ bool Screen::insertMode;
 bool Screen::eatNextChar;
 bool Screen::colorPopup;
 
-
-
-
-extern void turnOffEgaBlink( void );
-#pragma aux turnOffEgaBlink = \
-  "mov ax, 1003h" \
-  "mov bx, 0h"    \
-  "int 10h"
-
+bool Screen::preventSnow = false;
 
 
 // Not used ...
@@ -96,18 +91,19 @@ extern void setMode( void );
 
 int8_t Screen::init( char *userInputBuffer_p, uint8_t *switchToSession_p ) {
 
-
   // This always works: What is our current video mode?
   unsigned char mode = *((unsigned char far *)MK_FP( 0x40, 0x49 ));
 
   if ( mode == 7 ) {
     colorMode = false;
-    screenBase = (uint8_t far *)MK_FP( 0xb000, 0 );
+    screenBaseSeg = 0xb000;
   }
   else {
     colorMode = true;
-    screenBase = (uint8_t far *)MK_FP( 0xb800, 0 );
+    screenBaseSeg = 0xb800;
+    if ( getenv( "MTCP_NO_SNOW" ) ) preventSnow = true;
   }
+  screenBase = (uint8_t far *)MK_FP( screenBaseSeg, 0 );
 
 
   // Next, find out if we are on an EGA or VGA card
@@ -137,12 +133,25 @@ int8_t Screen::init( char *userInputBuffer_p, uint8_t *switchToSession_p ) {
 
   if ( isCGAorMDA ) {
 
-    uint16_t portBase = *((uint16_t far *)(MK_FP( 0x40, 0x63 ))) + 4;
+    uint8_t far *idBytePtr = (uint8_t far *)MK_FP( 0xffff, 0xe);
 
-    uint8_t modeSelectVal = *((uint8_t far *)(MK_FP( 0x40, 0x65 )));
-    modeSelectVal = modeSelectVal & 0xDF;
+    if ( *idBytePtr == 0xFD ) {
 
-    outp( portBase, modeSelectVal );
+      // Stupid PCjr does this in a non-standard way
+      inp( 0x3da );      // Read from the VGA to get it in a good mood.
+      outp( 0x3da, 3 );   // Tell it the register we want to hit.
+      outp( 0x3da, 0 );   // Turn off blinking
+
+    } else {
+
+      uint16_t portBase = *((uint16_t far *)(MK_FP( 0x40, 0x63 ))) + 4;
+
+      uint8_t modeSelectVal = *((uint8_t far *)(MK_FP( 0x40, 0x65 )));
+      modeSelectVal = modeSelectVal & 0xDF;
+
+      outp( portBase, modeSelectVal );
+
+    }
 
   }
   else {
@@ -177,8 +186,19 @@ int8_t Screen::init( char *userInputBuffer_p, uint8_t *switchToSession_p ) {
 
   // Draw initial screen
 
-  fillUsingWord( screenBase, 7<<8|32, screenRows * screenCols );
+  // First, erase the screen.  This is slower than just one call to
+  // fillUsingWord, but it lets us deal with CGA snow properly.
+  // Then draw the indicator line.
+
+  for ( int i=0; i < screenRows; i++ ) {
+    if ( preventSnow & ((i & 0x1) ==0) ) { waitForCGARetraceLong( ); }
+    fillUsingWord( screenBase + i*screenCols*2, 7<<8|32, screenCols );
+  }
+
+  if ( preventSnow ) { waitForCGARetraceLong( ); }
   fillUsingWord( separatorRowAddr, 7<<8|196, screenCols );
+
+  setBlockCursor( );
 
   return 0;
 }
@@ -193,6 +213,7 @@ int8_t Screen::init( char *userInputBuffer_p, uint8_t *switchToSession_p ) {
 
 void Screen::clearInputArea( void ) {
 
+  if ( preventSnow ) { waitForCGARetraceLong( ); }
   fillUsingWord( inputAreaStart, (7<<8|32), INPUT_ROWS * screenCols );
 
   input_len = 0;
@@ -215,6 +236,8 @@ void Screen::repaintInputArea( uint16_t offset, char far *buffer, uint16_t len )
 
   uint8_t far *target = inputAreaStart + offset*2;
 
+  if ( preventSnow ) { waitForCGARetraceLong( ); }
+
   for ( uint16_t i=0; i < len; i++ ) {
 
     if ( *buffer < 32 ) {
@@ -229,6 +252,7 @@ void Screen::repaintInputArea( uint16_t offset, char far *buffer, uint16_t len )
   }
 
   // Clear out to the end of the input area.
+  if ( preventSnow ) { waitForCGARetraceLong( ); }
   fillUsingWord( target, (7<<8|32), (SCBUFFER_MAX_INPUT_LEN-offset)*2 );
 
 }
@@ -641,7 +665,13 @@ void Screen::printf_internal( uint16_t x, uint16_t y, uint8_t attr, char *fmt, v
       default: {
         x++;
         if ( x == screenCols ) { x=0; y++; };
-        *start++ = ( attr << 8 | c );
+        uint16_t ch = ( attr << 8 | c );
+        if ( preventSnow ) { 
+          writeCharWithoutSnow(screenBaseSeg, FP_OFF(start),  ch  );
+        } else {
+          *start = ch;
+        }
+        start++;
         break;
       }
     }
@@ -655,6 +685,7 @@ void Screen::printf_internal( uint16_t x, uint16_t y, uint8_t attr, char *fmt, v
 
 void Screen::repeatCh( uint16_t x, uint16_t y, uint8_t attr, char ch, uint16_t count ) {
   uint16_t far *start = (uint16_t far *)(screenBase) + (y * screenCols) + x;
+  if ( preventSnow ) { waitForCGARetraceLong( ); }
   fillUsingWord( start, (attr<<8) | ch, count );
 }
 

@@ -18,6 +18,7 @@
 # -zpw  Use with above; make sure you are warning free!
 # -0    8088/8086 class code generation
 # -s    disable stack overflow checking
+# -zmf  put each function in a new code segment; helps with linking
 
 # For this code performance is not an issue.  Make it small.
 
@@ -29,7 +30,7 @@ memory_model = -ms
 compile_options = -0 $(memory_model) -DCFG_H="sntp.cfg" -oh -ok -os -s -oa -ei -zp2 -zpw -we
 compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
-tcpobjs = packet.obj arp.obj eth.obj ip.obj utils.obj timer.obj ipasm.obj udp.obj dns.obj
+tcpobjs = packet.obj arp.obj eth.obj ip.obj utils.obj timer.obj ipasm.obj udp.obj dns.obj trace.obj
 objs = sntp.obj
 
 all : clean sntp.exe
@@ -40,7 +41,7 @@ clean : .symbolic
   @del *.map
 
 patch : .symbolic
-  ..\..\utils\patch sntp.exe sntp.map $(memory_model)
+  ..\..\utils\ptach sntp.exe sntp.map $(memory_model)
 
 .asm : $(tcp_c_dir)
 
@@ -53,4 +54,4 @@ patch : .symbolic
   wpp $[* $(compile_options)
 
 sntp.exe : $(tcpobjs) $(objs)
-  wlink system dos option map option stack=4096 name $@ file *.obj
+  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj

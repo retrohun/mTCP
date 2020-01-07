@@ -1,8 +1,7 @@
-
 /*
 
    mTCP TelnetSc.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -30,6 +29,8 @@
    2013-03-15: Add scroll region support, DEC origin mode, and make
                cursor handling at the right margin operate like putty
                because they seem to do it right.
+   2015-01-22: Add 132 column support
+   2018-10-27: Add code to prevent CGA snow
 
 */
 
@@ -46,6 +47,7 @@
 #include "types.h"
 #include "telnetsc.h"
 #include "utils.h"
+//#include "trace.h"
 
 
 
@@ -93,65 +95,38 @@
 
 int8_t Screen::init( uint8_t backScrollPages, uint8_t initWrapMode ) {
 
-  #ifdef __TURBOC__
-  // Detect the current screen rows
-  struct text_info ti;
-  gettextinfo( &ti );
-
-  ScreenRows = ti.screenheight;
-
-  // What video mode are we in?
-
-  if ( ti.currmode == MONO ) {
-    // Monochrome is current
-    colorCard = 0;
-    Screen_base = (uint8_t far *)MK_FP( 0xb000, 0 );
-  }
-  else {
-    colorCard = 1;
-    Screen_base = (uint8_t far *)MK_FP( 0xb800, 0 );
-  }
-  #else
+  preventSnow = false;
 
   // This always works:
   unsigned char mode = *((unsigned char far *)MK_FP( 0x40, 0x49 ));
 
   if ( mode == 7 ) {
-    colorCard = 0;
-    Screen_base = (uint8_t far *)MK_FP( 0xb000, 0 );
+    colorCard = false;
+    screenBaseSeg = 0xb000;
   }
   else {
-    colorCard = 1;
-    Screen_base = (uint8_t far *)MK_FP( 0xb800, 0 );
+    colorCard = true;
+    screenBaseSeg = 0xb800;
+    if ( getenv( "MTCP_NO_SNOW" ) ) preventSnow = true;
   }
+  Screen_base = (uint8_t far *)MK_FP( screenBaseSeg, 0 );
 
-  // Call int 10, ah=12 for EGA/VGA config
+  if ( getEgaMemSize( ) == 0x10 ) {
 
-  union REGS inregs, outregs;
-  struct SREGS segregs;
-
-  inregs.h.ah = 0x12;
-  inregs.h.bl = 0x10;
-  int86x( 0x10, &inregs, &outregs, &segregs );
-
-  if ( outregs.h.bl == 0x10 ) {
     // Failed.  Must be MDA or CGA
-    ScreenRows = 25;
+    terminalLines = 25;
+    terminalCols = 80;
+
   }
   else {
-    ScreenRows = *((unsigned char far *)MK_FP( 0x40, 0x84 )) + 1;
+
+    terminalLines = *((unsigned char far *)MK_FP( 0x40, 0x84 )) + 1;
+    terminalCols = *((unsigned char far *)MK_FP( 0x40, 0x4A ));
+
   }
 
-  #endif
 
-
-  // By this point we have an 80 column screen.  The number of rows is
-  // also known, and we know if we are on a color display or a 5151.
-
-  ScreenCols = SCREEN_COLS;
-
-  terminalLines = ScreenRows;
-  terminalCols = ScreenCols;
+  bytesPerLine = terminalCols * 2;
 
 
   // Setup the virtual buffer.  The virtual buffer also serves as the
@@ -161,26 +136,24 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initWrapMode ) {
 
   // Desired size of virtual buffer
   uint32_t desiredBufferSize = backScrollPages * terminalLines;
-  desiredBufferSize = desiredBufferSize * BYTES_PER_LINE;
+  desiredBufferSize = desiredBufferSize * bytesPerLine;
 
   if ( desiredBufferSize > 64001ul ) {
     // Too much .. get them into 64K
-    uint16_t newBackScrollPages = 64000ul / (terminalLines * BYTES_PER_LINE );
+    uint16_t newBackScrollPages = 64000ul / (terminalLines * bytesPerLine );
     backScrollPages = newBackScrollPages;
   }
 
 
   totalLines = terminalLines * backScrollPages;
 
-  bufferSize = totalLines * BYTES_PER_LINE;
+  bufferSize = totalLines * bytesPerLine;
 
   buffer = (uint8_t *)malloc( bufferSize );
 
-  if ( buffer == NULL ) return -1;
-
-  for ( uint16_t i=0; i < bufferSize; i=i+2 ) {
-    buffer[i] = 32;
-    buffer[i+1] = 7;
+  if ( buffer == NULL ) {
+    Screen_base = 0;
+    return -1;
   }
 
   // Used to quickly detect when we are past the end of our buffer.
@@ -188,9 +161,28 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initWrapMode ) {
 
   wrapMode = initWrapMode;
 
+  resetTerminalState( );
+
+  return 0;
+}
+
+
+void Screen::resetTerminalState( void ) {
+
+  // Clear out the backscroll buffer
+
+  for ( uint16_t i=0; i < bufferSize; i=i+2 ) {
+    buffer[i] = 32;
+    buffer[i+1] = 7;
+  }
+
+  // Reset the cursor, attributes, and terminal properties
+
   cursor_x = 0;
   cursor_y = 0;
   curAttr = 7;
+
+  overhang = false;
 
   topOffset = 0;
   backScrollOffset = 0;
@@ -200,13 +192,11 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initWrapMode ) {
 
   // We are going to keep this up to date instead of computing it for each
   // character.
-  vidBufPtr = Screen_base + ( ((cursor_x<<1) + (cursor_y<<7) + (cursor_y<<5)) );
-
-  overhang = false;
-
+  vidBufPtr = Screen_base + ( (cursor_x<<1) + (cursor_y*bytesPerLine) );
 
   clearConsole( );
   gotoxy( 0, 0 );
+  setBlockCursor( );
 
 
   // Terminal emulation state
@@ -217,25 +207,26 @@ int8_t Screen::init( uint8_t backScrollPages, uint8_t initWrapMode ) {
   originMode = false;
   autoWrap = false;
 
-  return 0;
+  // If the save area has not been initialized then these values are used.
+  // Which also happen to be the same as the initial values.
+
+  cursorSaveArea.cursor_x = 0;
+  cursorSaveArea.cursor_y = 0;
+  cursorSaveArea.curAttr = 7;
+  cursorSaveArea.originMode = false;
+  cursorSaveArea.autoWrap = false;
+
 }
-
-
-
 
 
 
 // Updates the real screen, nothing else ...
 
 void Screen::clearConsole( void ) {
-  #ifdef __TURBOC__
-  textattr( 7 );
-  clrscr( );
-  #else
-  //uint16_t len = ScreenRows*80 + ScreenCols;
-  uint16_t len = ScreenRows*80;
-  fillUsingWord( (uint16_t far *)Screen_base, (7<<8|32), len );
-  #endif
+  for ( int i=0; i < terminalLines; i++ ) {
+    if ( preventSnow & ((i & 0x1) ==0) ) { waitForCGARetraceLong( ); }
+    fillUsingWord( (uint16_t far *)Screen_base + (i*terminalCols), (7<<8|32), terminalCols );
+  }
 }
 
 
@@ -253,33 +244,13 @@ void Screen::myCprintf( uint8_t x, uint8_t y, uint8_t attr, char *fmt, ... ) {
 }
 
 
-void Screen::myCprintf( uint8_t attr, char *fmt, ... ) {
-
-  int x = wherex( );
-  int y = wherey( );
-
-  va_list ap;
-  va_start( ap, fmt );
-  myCprintf_internal( x, y, attr, fmt, ap );
-  va_end( ap );
-
-}
-
-
 void Screen::myCprintf_internal( uint8_t x, uint8_t y, uint8_t attr, char *fmt, va_list ap ) {
 
-  //va_list ap;
-  //va_start( ap, fmt );
-  #ifdef __TURBOC__
-  vsprintf( cprintfBuffer, fmt, ap );
-  #else
   vsnprintf( cprintfBuffer, 100, fmt, ap );
-  #endif
-  //va_end( ap );
 
   cprintfBuffer[99] = 0;
 
-  uint16_t far *start = (uint16_t far *)(Screen_base + (y*80+x)*2);
+  uint16_t far *start = (uint16_t far *)(Screen_base + (y*terminalCols+x)*2);
 
   uint16_t len = strlen( cprintfBuffer );
 
@@ -290,18 +261,24 @@ void Screen::myCprintf_internal( uint8_t x, uint8_t y, uint8_t attr, char *fmt, 
     switch ( c ) {
       case '\n': {
         x = 0;
-        start = (uint16_t far *)(Screen_base + (y*80+x)*2);
+        start = (uint16_t far *)(Screen_base + (y*terminalCols+x)*2);
         break;
       }
       case '\r': {
         y++;
-        start = (uint16_t far *)(Screen_base + (y*80+x)*2);
+        start = (uint16_t far *)(Screen_base + (y*terminalCols+x)*2);
         break;
       }
       default: {
         x++;
-        if ( x == 80 ) { x=0; y++; };
-        *start++ = ( attr << 8 | c );
+        if ( x == terminalCols ) { x=0; y++; };
+        uint16_t ch = ( attr << 8 | c );
+        if ( preventSnow ) {
+          writeCharWithoutSnow(screenBaseSeg, FP_OFF(start),  ch  );
+	} else {
+          *start = ch;
+	}
+        start++;
         break;
       }
     }
@@ -423,7 +400,7 @@ void Screen::adjustVertical( int16_t delta ) {
 
 /*
 void Screen::repeatCh( uint8_t x, uint8_t y, uint8_t attr, char ch, uint8_t count ) {
-  uint16_t far *start = (uint16_t far *)(Screen_base + (y*80+x)*2);
+  uint16_t far *start = (uint16_t far *)(Screen_base + (y*terminalCols+x)*2);
   uint16_t fillWord = (attr<<8) | ch;
   fillUsingWord( start, fillWord, count );
 }
@@ -482,7 +459,7 @@ void Screen::scrollInternal( void ) {
     // Classic scrolling behavior - lines at the top get pushed into to
     // scroll buffer.
 
-    topOffset += BYTES_PER_LINE;
+    topOffset += bytesPerLine;
     if ( topOffset == bufferSize ) topOffset = 0;
 
     // Clear the newly opened line in the virtual buffer.
@@ -492,7 +469,8 @@ void Screen::scrollInternal( void ) {
     uint16_t far *tmp = (uint16_t *)(buffer + ScrOffset( 0, cursor_y ));
 
     uint16_t fillWord = (curAttr<<8) | 0x20;
-    fillUsingWord( tmp, fillWord, 80 );
+    if ( preventSnow ) { waitForCGARetraceLong( ); }
+    fillUsingWord( tmp, fillWord, terminalCols );
 
   }
 
@@ -600,6 +578,8 @@ void Screen::add( char *buf, uint16_t len ) {
       // Remember this in case we need to repeat the last char for an ANSI op
       lastChar = c;
 
+      //TRACE(( "Printing char %x, overhang = %u, cursor_x = %u\n", c, overhang, cursor_x ));
+
       // If the previous cursor position left us in the overhang now we
       // can wrap (if required) and scroll down.  Do this before printing
       // the next character.
@@ -633,11 +613,17 @@ void Screen::add( char *buf, uint16_t len ) {
         cursor_x++;
       }
 
+      //TRACE(( "    overhang = %u, cursor_x = %u\n", overhang, cursor_x ));
 
       if ( updateRealScreen ) {
 
-        *vidBufPtr = c;
-        *(vidBufPtr + 1) = curAttr;
+        uint16_t ch = ( curAttr << 8 | c );
+
+	if ( preventSnow ) {
+	  writeCharWithoutSnow( screenBaseSeg, FP_OFF(vidBufPtr), ch );
+	} else {
+	  *((uint16_t far *)vidBufPtr) = ch;
+	}
 
         // If overhang is not set then we can advance.  Otherwise, wait
         if ( overhang == false ) {
@@ -674,9 +660,10 @@ void Screen::paint( void ) {
 
   for ( uint8_t i = 0; i < terminalLines; i++ ) {
 
-    memcpy( Screen_base + sOffset, buffer + vOffset, BYTES_PER_LINE );
-    sOffset = sOffset + BYTES_PER_LINE; // No need to check for wrap here.
-    vOffset = vOffset + BYTES_PER_LINE; // But need to check for wrap here.
+    if ( preventSnow & ((i & 0x1) ==0) ) { waitForCGARetraceLong( ); }
+    memcpy( Screen_base + sOffset, buffer + vOffset, bytesPerLine );
+    sOffset = sOffset + bytesPerLine; // No need to check for wrap here.
+    vOffset = vOffset + bytesPerLine; // But need to check for wrap here.
     if ( vOffset >= bufferSize ) vOffset = 0;
 
   }
@@ -720,7 +707,7 @@ void Screen::paint( int16_t offsetLines ) {
   // Do this math in such a way as to ensure that we don't have a
   // negative result, even if temporarily.
 
-  uint16_t topOffsetLines = topOffset/BYTES_PER_LINE;
+  uint16_t topOffsetLines = topOffset/bytesPerLine;
 
   uint16_t newOffsetLines;
   if ( topOffsetLines < backScrollOffset ) {
@@ -730,15 +717,16 @@ void Screen::paint( int16_t offsetLines ) {
     newOffsetLines = topOffsetLines - backScrollOffset;
   }
 
-  uint8_t far *source = buffer + ( newOffsetLines * BYTES_PER_LINE );
+  uint8_t far *source = buffer + ( newOffsetLines * bytesPerLine );
 
 
   uint16_t sOffset = 0;
   for ( uint8_t i = 0; i < terminalLines; i++ ) {
 
-    memcpy( Screen_base + sOffset, source, BYTES_PER_LINE );
-    sOffset = sOffset + BYTES_PER_LINE;
-    source = source + BYTES_PER_LINE;
+    if ( preventSnow & ((i & 0x1) ==0) ) { waitForCGARetraceLong( ); }
+    memcpy( Screen_base + sOffset, source, bytesPerLine );
+    sOffset = sOffset + bytesPerLine;
+    source = source + bytesPerLine;
     if ( source >= bufferEnd ) source = buffer;
   }
 
@@ -762,7 +750,7 @@ void Screen::clear( uint16_t top_x, uint16_t top_y, uint16_t bot_x, uint16_t bot
   // Add the +1 at the end because we need to clear the last byte inclusive,
   // not just up to the last byte.
 
-  uint16_t chars = (bot_y*80+bot_x) - (top_y*80+top_x) + 1;
+  uint16_t chars = (bot_y*terminalCols+bot_x) - (top_y*terminalCols+top_x) + 1;
   uint16_t bytes = chars << 1;
 
   uint16_t fillWord = (curAttr<<8) | 0x20;
@@ -772,18 +760,7 @@ void Screen::clear( uint16_t top_x, uint16_t top_y, uint16_t bot_x, uint16_t bot
     // Contiguous storage
     //
     // for ( uint16_t i=0; i < bytes; i=i+2 ) { *start++ = fillWord; }
-
-    #ifdef __TURBOC__
-    asm {
-      push es; push di; cld;
-      mov ax, fillWord; les di, start; mov cx, chars;
-      rep stosw;
-      pop di; pop es;
-    }
-    #else
-    //for ( uint16_t i=0; i < bytes; i=i+2 ) { *start++ = fillWord; }
     fillUsingWord( start, fillWord, chars );
-    #endif
 
   }
   else {
@@ -793,38 +770,16 @@ void Screen::clear( uint16_t top_x, uint16_t top_y, uint16_t bot_x, uint16_t bot
     uint16_t bytes2 = bufferEnd - (uint8_t *)start;
 
     // for ( uint16_t i=0; i < bytes2; i=i+2 ) { *start++ = fillWord; }
-
-    #ifdef __TURBOC__
-    asm {
-      push es; push di; cld;
-      mov ax, fillWord; les di, start; mov cx, bytes2; shr cx, 1;
-      rep stosw;
-      pop di; pop es;
-    }
-    #else
-    // for ( uint16_t i=0; i < bytes2; i=i+2 ) { *start++ = fillWord; }
     uint16_t t1 = bytes2 / 2;
     fillUsingWord( start, fillWord, t1 );
-    #endif
 
 
     start = (uint16_t *)buffer;
     bytes = bytes - bytes2;
 
-    // for ( i=0; i < bytes; i=i+2 ) { *start++ = fillWord; }
-
-    #ifdef __TURBOC__
-    asm {
-      push es; push di; cld;
-      mov ax, fillWord; les di, start; mov cx, bytes; shr cx, 1;
-      rep stosw;
-      pop di; pop es;
-    }
-    #else
     // for ( uint16_t i=0; i < bytes; i=i+2 ) { *start++ = fillWord; }
     uint16_t t2 = bytes / 2;
     fillUsingWord( start, fillWord, t2 );
-    #endif
 
   }
 
@@ -836,7 +791,7 @@ void Screen::clear( uint16_t top_x, uint16_t top_y, uint16_t bot_x, uint16_t bot
 
     // This is a minor operation so update the screen at the same time.
 
-    uint16_t far *scStart = (uint16_t far *)(Screen_base + ( ((top_x<<1) + (top_y<<7) + (top_y<<5)) ) );
+    uint16_t far *scStart = (uint16_t far *)(Screen_base + ( (top_x<<1) + (top_y*bytesPerLine) ) );
 
     /*
     for ( uint16_t i=0; i < bytes; i=i+2 ) {
@@ -851,17 +806,9 @@ void Screen::clear( uint16_t top_x, uint16_t top_y, uint16_t bot_x, uint16_t bot
     //
     // The remainder is done outside the loop.
 
-    #ifdef __TURBOC__
-    asm {
-      push es; push di; cld;
-      mov ax, fillWord; les di, scStart; mov cx, chars;
-      rep stosw;
-      pop di; pop es;
-    }
-    #else
-      // for ( uint16_t i=0; i < chars; i++ ) { *scStart++ = fillWord; }
-      fillUsingWord( scStart, fillWord, chars );
-    #endif
+    // for ( uint16_t i=0; i < chars; i++ ) { *scStart++ = fillWord; }
+    if ( preventSnow ) { waitForCGARetraceLong( ); }
+    fillUsingWord( scStart, fillWord, chars );
 
   }
   else {
@@ -886,10 +833,10 @@ void Screen::insLine( uint16_t line_y ) {
   if ( line_y > scrollRegion_bottom ) return;
 
   // To insert a line, all visible lines below the current line get
-  // copied downward BYTES_PER_LINE bytes.
+  // copied downward bytesPerLine bytes.
 
   for ( uint8_t i=scrollRegion_bottom; i > line_y; i-- ) {
-    memcpy( buffer + ScrOffset( 0, i ), buffer + ScrOffset( 0, i-1 ), BYTES_PER_LINE );
+    memcpy( buffer + ScrOffset( 0, i ), buffer + ScrOffset( 0, i-1 ), bytesPerLine );
   }
 
   // For one line at the bottom it makes sense to keep the screen in sync,
@@ -918,7 +865,7 @@ void Screen::delLine( uint16_t line_y ) {
   if ( line_y > scrollRegion_bottom ) return;
 
   for ( uint8_t i=line_y; i < scrollRegion_bottom; i++ ) {
-    memcpy( buffer + ScrOffset( 0, i ), buffer + ScrOffset( 0, i+1 ), BYTES_PER_LINE );
+    memcpy( buffer + ScrOffset( 0, i ), buffer + ScrOffset( 0, i+1 ), bytesPerLine );
   }
 
   // For one line at the bottom it makes sense to keep the screen in sync,
@@ -980,8 +927,9 @@ void Screen::delChars( uint16_t len ) {
     if ( bytesToMove ) {
 
       // This is a minor operation so update the screen at the same time.
-      uint8_t far *src = Screen_base + ( (((cursor_x+len)<<1) + (cursor_y<<7) + (cursor_y<<5)) );
-      uint8_t far *dst = Screen_base + ( ((cursor_x<<1) + (cursor_y<<7) + (cursor_y<<5)) );
+      uint8_t far *src = Screen_base + ( ((cursor_x+len)<<1) + (cursor_y*bytesPerLine) );
+      uint8_t far *dst = Screen_base + ( (cursor_x<<1) + (cursor_y*bytesPerLine) );
+      if ( preventSnow ) { waitForCGARetraceLong( ); }
       memmove( dst, src, bytesToMove );
 
     } // endif bytesToMove
@@ -1040,8 +988,9 @@ void Screen::insChars( uint16_t len ) {
     if ( bytesToMove ) {
 
       // This is a minor operation so update the screen at the same time.
-      uint8_t far *src = Screen_base + ( (((cursor_x)<<1) + (cursor_y<<7) + (cursor_y<<5)) );
-      uint8_t far *dst = Screen_base + ( (((cursor_x+len)<<1) + (cursor_y<<7) + (cursor_y<<5)) );
+      uint8_t far *src = Screen_base + ( (cursor_x<<1) + (cursor_y*bytesPerLine) );
+      uint8_t far *dst = Screen_base + ( ((cursor_x+len)<<1) + (cursor_y*bytesPerLine) );
+      if ( preventSnow ) { waitForCGARetraceLong( ); }
       memmove( dst, src, bytesToMove );
 
     } // else if bytesToMove
@@ -1075,36 +1024,19 @@ void Screen::eraseChars( uint16_t len ) {
   // Virtual buffer first.
   uint16_t far *tmp = (uint16_t *)(buffer + ScrOffset( cursor_x, cursor_y ));
 
-  #ifdef __TURBOC__
-  _AX = fillAttr;
-
-  asm {
-    push es; push di; cld;
-    les  di, tmp; mov cx, len;
-    rep stosw;
-    pop di; pop es;
-  }
-  #else
   for (uint16_t i=0; i < len; i++ ) { *tmp++ = fillAttr; }
   fillUsingWord( tmp, fillAttr, len );
-  #endif
 
 
   if ( updateRealScreen ) {
 
     // Same thing, but now on the real screen.
 
-    #ifdef __TURBOC__
-    uint16_t far *src = (uint16_t *)(Screen_base + ( (((cursor_x)<<1) + (cursor_y<<7) + (cursor_y<<5)) ));
+    uint16_t far *src = (uint16_t *)(Screen_base + ( (cursor_x<<1) + (cursor_y*bytesPerLine) ));
+    if ( preventSnow ) { waitForCGARetraceLong( ); }
     for ( uint16_t i=0; i < len; i++ ) {
       *src++ = fillAttr;
     }
-    #else
-    uint16_t far *src = (uint16_t *)(Screen_base + ( (((cursor_x)<<1) + (cursor_y<<7) + (cursor_y<<5)) ));
-    for ( uint16_t i=0; i < len; i++ ) {
-      *src++ = fillAttr;
-    }
-    #endif
 
   }
   else {
@@ -1114,4 +1046,19 @@ void Screen::eraseChars( uint16_t len ) {
 }
 
 
+void Screen::saveCursor( void ) {
+  cursorSaveArea.cursor_x = cursor_x;
+  cursorSaveArea.cursor_y = cursor_y;
+  cursorSaveArea.curAttr = curAttr;
+  cursorSaveArea.originMode = originMode;
+  cursorSaveArea.autoWrap = autoWrap;
+}
 
+
+void Screen::restoreCursor( void ) {
+  cursor_x = cursorSaveArea.cursor_x;
+  cursor_y = cursorSaveArea.cursor_y;
+  curAttr = cursorSaveArea.curAttr;
+  originMode = cursorSaveArea.originMode;
+  autoWrap = cursorSaveArea.autoWrap;
+}

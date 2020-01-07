@@ -2,7 +2,7 @@
 /*
 
    mTCP Keys.cpp
-   Copyright (C) 2011-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2011-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -71,6 +71,7 @@ Key_t getKey( void ) {
       case 80: { rc.specialKey = K_CursorDown;  break; }
       case 81: { rc.specialKey = K_PageDown;    rc.local = 1; break; }
       case 82: { rc.specialKey = K_Insert;      break; }
+      case 83: { rc.specialKey = K_Delete;      break; }
 
     }
 

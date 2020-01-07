@@ -1,8 +1,7 @@
-
 /*
 
    mTCP TcpSockM.H
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -64,6 +63,8 @@ class TcpSocketMgr {
 
     static TcpSocket *accept( void );
 
+
+    static inline int8_t getSocketsPendingAccept( void ) { return pendingAccepts; }
 
     // Used by TcpSocket
 

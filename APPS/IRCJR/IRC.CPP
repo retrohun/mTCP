@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Irc.cpp
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -42,6 +41,7 @@
    2013-03-30: Add more options for where to put nick changes and quit msgs
    2013-04-10: Redo the help screen to save space by embedding the
                color codes right in the text.  (Saves almost 1kb)
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -61,8 +61,9 @@
 #include "screen.h"
 
 
-#include "utils.h"
 #include "timer.h"
+#include "trace.h"
+#include "utils.h"
 
 #include "packet.h"
 #include "arp.h"
@@ -262,18 +263,18 @@ Session *getTargetSession( char *targetSessionName, bool flipOnCreate );
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
+// Ctrl-Break and Ctrl-C handlers.
 
 // Check this flag once in a while to see if the user wants out.
 volatile uint8_t CtrlBreakDetected = 0;
-
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
 
+void __interrupt __far ctrlCHandler( ) {
+  // Do Nothing - Ctrl-C is a legal character
+}
 
 const char CtrlBreakMsg[] = "\nCtrl-Break detected: exiting\n";
 
@@ -322,7 +323,7 @@ static char Msg_JoinedChannel[] = "You joined channel %s\n";
 
 
 
-static char CopyrightMsg1[] = "mTCP IRCjr by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2013\n";
+static char CopyrightMsg1[] = "mTCP IRCjr by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 
@@ -347,7 +348,7 @@ int main( int argc, char *argv[] ) {
   getCfgOpts( );
 
   // One socket, 5 outgoing TCP buffers
-  if ( Utils::initStack( 1, 5 ) ) {
+  if ( Utils::initStack( 1, 5, ctrlBreakHandler, ctrlCHandler ) ) {
     puts( "IRCjr: could not init TCP/IP" );
     exit(1);
   }
@@ -360,15 +361,6 @@ int main( int argc, char *argv[] ) {
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too.  Ctrl-C is only checked for when we
-  // do I/O calls, so the lag on it might be longer.
-  setvect( 0x23, ctrlBreakHandler);
 
 
   Screen::init( inputBuffer, &switchToSession );
@@ -694,10 +686,13 @@ int16_t registerWithServer( void ) {
         SessionState = SentNickAndUser;
 
       }
-
+      else if ( LastServerError == IRC_ERR_PASSWD_MISMATCH ) {
+        CS->puts( scErr, "\nThe server rejected your password.  Please fix it.\n\n" );
+        return -1;
+      }
       else {
         // Unknown error response from server
-        CS->puts( scErr, "\nUnknown response from server\n" );
+        CS->puts( scErr, "\nUnknown response from server - giving up.\n" );
         return -1;
       }
 
@@ -755,6 +750,8 @@ int16_t waitForStateChange( uint16_t seconds ) {
 //  -2 - Server closed our socket
 
 int16_t getLimitedInput( void ) {
+
+  Screen::updateCursor( );
 
   while ( 1 ) {
 
@@ -821,6 +818,7 @@ void updateIndicatorLine( uint16_t x, uint8_t attr, char *msg ) {
 void updateIndicatorChannel( void ) {
 
   // Blot out the old contents
+  if ( Screen::isPreventSnowOn( ) ) { waitForCGARetraceLong( ); }
   fillUsingWord( Screen::getSeparatorRowAddress(), (scNormal<<8)|196, 37 );
 
   // Write the name
@@ -851,8 +849,15 @@ void updateIndicatorChannel( void ) {
         tmp = scNormal;
       }
     }
+
     tmp = (tmp<<8) | (i+'0');
-    *indicatorPtr = tmp;
+
+    if ( Screen::isPreventSnowOn( ) ) {
+      writeCharWithoutSnow( Screen::getScreenBaseSeg( ), FP_OFF(indicatorPtr), tmp );
+    } else {
+      *indicatorPtr = tmp;
+    }
+
     indicatorPtr++;
   }
       
@@ -1279,7 +1284,7 @@ void processStats( void ) {
            Tcp::Packets_SeqOrAckError, Tcp::Packets_DroppedNoSpace );
 
   CS->printf( Session::PrintOpts_none, scLocalMsg, "IP packets: Udp Rcvd: %lu  Icmp Rcvd: %lu  Frags: %lu  ChksumErr: %lu\n",
-           Ip::udpRecvPackets, Ip::icmpRecvPackets, Ip::fragsReceived, Ip::badChecksum );
+           Udp::Packets_Received, Ip::icmpRecvPackets, Ip::fragsReceived, Ip::badChecksum );
 
   CS->printf( Session::PrintOpts_none, scLocalMsg, "Packets: Sent: %lu Rcvd: %lu Dropped: %lu SndErrs: %lu LowFreeBufCount: %u\n\n",
           Packets_sent, Packets_received, Packets_dropped, Packets_send_errs, Buffer_lowFreeCount );
@@ -1334,13 +1339,11 @@ void shutdown( int rc ) {
     Session::removeActiveSession( Session::activeSessionList[i-1] );
   }
 
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-  // Utils::dumpStats( stdout );
-  fclose( TrcStream );
+
   puts( "\nIRCjr - Get your daily dose of DOS!" );
   puts( "Please send comments and bug reports to mbbrutman@gmail.com");
+
   exit( rc );
 }
 
@@ -2535,7 +2538,7 @@ void initScreen( void ) {
            MyEthAddr[0], MyEthAddr[1], MyEthAddr[2],
            MyEthAddr[3], MyEthAddr[4], MyEthAddr[5] );
 
-  CS->printf( Session::PrintOpts_none, scNormal, "Packet interrupt: 0x%02X\n\n", Packet_int );
+  CS->printf( Session::PrintOpts_none, scNormal, "Packet interrupt: 0x%02X\n\n", Packet_getSoftwareInt() );
 
   CS->draw( );
 }

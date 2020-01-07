@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Eth.H
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -36,7 +35,8 @@
 #define _ETH_HEADER_H
 
 #include "types.h"
-#include "Utils.h"
+#include "inlines.h"
+
 
 #define ETH_MTU_MIN    46
 #define ETH_MTU_MAX  1500

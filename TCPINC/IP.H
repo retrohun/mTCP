@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ip.H
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,15 +26,49 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2014-05-19: Add some static checks to the configuration options
+   2015-02-07: Change MyIpAddr_u and Netmask_u to be host order to
+               save some code space and speed things up.
 
 */
-
 
 
 #ifndef _IP_H
 #define _IP_H
 
+
+
+// Load and check the configuration options
+
+#include CFG_H
 #include "Utils.h"
+
+// IP packets can be as large as 64KB.  Standard Ethernet MTU is 1500; anything
+// larger than that falls into jumbo frame category.  This code is not tested
+// with jumbo frames, but it should work.
+//
+// The number of fragmented packets you can reassemble is limited by the
+// maximum size of the packets.  Everything has to fit inside of a 64K segment
+// so don't go nuts.  The IP_BIGPACKET_SIZE does not include the IP header; it
+// is just a payload number, which is why it is not 1500 even.
+//
+// Note that all of these only apply if fragments are turned on.  Otherwise,
+// IP has no configuration defines.
+
+#ifdef IP_FRAGMENTS_ON
+static_assert( IP_MAX_FRAG_PACKETS >= 1 );
+static_assert( IP_MAX_FRAG_PACKETS <= 8 );
+static_assert( IP_MAX_FRAGS_PER_PACKET >=  2 );
+static_assert( IP_MAX_FRAGS_PER_PACKET <= 16 );
+static_assert( IP_BIGPACKET_SIZE >= 1480 );
+static_assert( IP_BIGPACKET_SIZE <= 8192 );
+static_assert( IP_FRAG_REASSEMBLY_TIMEOUT >= 2000ul );
+static_assert( IP_FRAG_REASSEMBLY_TIMEOUT <= 8000ul );
+#endif
+
+
+
+
 
 
 
@@ -51,8 +84,15 @@ extern IpAddr_t MyIpAddr;
 extern IpAddr_t Gateway;
 extern IpAddr_t Netmask;
 
+
+// Cached versions of variables above.  Note that these are not in network
+// byte order!  This is for performance; as long as you use the methods
+// to set MyIpAddr and Netmask you will be fine.
+
 extern uint32_t MyIpAddr_u;
 extern uint32_t Netmask_u;
+
+
 
 extern IpAddr_t IpBroadcast;
 extern IpAddr_t IpThisMachine;
@@ -143,7 +183,7 @@ class IpHeader {
 
     void set( uint8_t protocol, const IpAddr_t dstHost, uint16_t payloadLen, uint8_t moreFrags, uint16_t fragOffset );
 
-    int8_t setDestEth( EthAddr_t *ethTarget );
+    int8_t setDestEth( EthAddr_t ethTarget );
 
     static uint16_t IpIdent;
 };
@@ -158,8 +198,6 @@ class Ip {
 
     // Statistics
 
-    static uint32_t tcpRecvPackets;
-    static uint32_t udpRecvPackets;
     static uint32_t icmpRecvPackets;
     static uint32_t ptrWrapCorrected;
     static uint32_t badChecksum;
@@ -187,7 +225,37 @@ class Ip {
       *((uint32_t *)target) = *((uint32_t *)source);
     };
 
-    static void process( uint8_t *packet );
+
+    // Setters for MyIpAddr and Netmask; these keep the cached _u versions in sync.
+
+    static inline void setMyIpAddr( uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4 ) {
+      MyIpAddr[0] = o1; MyIpAddr[1] = o2; MyIpAddr[2] = o3; MyIpAddr[3] = o4;
+      MyIpAddr_u = *(uint32_t *)(MyIpAddr);
+    }
+
+    static inline void setMyIpAddr( const IpAddr_t source ) {
+      *((uint32_t *)MyIpAddr) = *((uint32_t *)source);
+      MyIpAddr_u = *(uint32_t *)(source);
+    }
+
+    // The incoming parameter is in host order, not network byte order!
+    static inline void setMyIpAddr( uint32_t newAddr_u ) {
+      *(uint32_t *)(MyIpAddr) = newAddr_u;
+      MyIpAddr_u = newAddr_u;
+    }
+
+    static inline void setMyNetmask( uint8_t o1, uint8_t o2, uint8_t o3, uint8_t o4 ) {
+      Netmask[0] = o1; Netmask[1] = o2; Netmask[2] = o3; Netmask[3] = o4;
+      Netmask_u = *(uint32_t *)(Netmask);
+    }
+
+    static inline void setMyNetmask( const IpAddr_t source ) {
+      *((uint32_t *)Netmask) = *((uint32_t *)source);
+      Netmask_u = *(uint32_t *)(source);
+    }
+
+
+    static void process( uint8_t *packet, uint16_t packetLen );
 
     static void dumpStats( FILE *stream );
 
@@ -217,7 +285,15 @@ class Ip {
 
 
 
+//-----------------------------------------------------------------------------
+//
+// ICMP
+
 #ifdef COMPILE_ICMP
+
+static_assert( ICMP_ECHO_OPT_DATA >= 32 );
+static_assert( ICMP_ECHO_OPT_DATA <= 256 );
+
 
 #include "Eth.h"
 

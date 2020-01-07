@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Dhcp.cpp
-   Copyright (C) 2008-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2008-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -31,6 +30,17 @@
                that are slow to initialize.
    2013-03-29: Add numerical timestamp to DHCP timestamp message
                to make it easier to compute lease expiration.
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling; get
+               rid of view packet stats command line option
+   2015-04-10: Add preferred nameserver support; fix code to use
+               the same buffers and lengths as the corresponding
+               Utils code; fix makefile system to remove false
+               dependency on ARP to make the filesize smaller.
+   2015-04-19: Refactoring: let the Utils class parse the optional
+               environment variables to reduce code duplication.
+   2019-09-01: Enable warnings for trailing white space in the config file.
+               Make usage of stderr more consistent.  Small refactors to
+               try to claim back some executable size.
 
 */
 
@@ -52,11 +62,22 @@
 
 #include "utils.h"
 #include "timer.h"
+#include "trace.h"
 #include "packet.h"
 #include "arp.h"
 #include "udp.h"
 
 #include "dhcp.h"
+
+
+
+// A maximum DOS pathname is 64 characters, excluding the drive letter and
+// colon.  Add two bytes for that, and one byte for the null terminator to
+// get 67 bytes for a path.  Then add 12 bytes for the 8.3 format filename
+// to get 79 bytes for a complete drive, path, and filename buffer.
+
+#define DOS_MAX_PATH_LENGTH     (67)
+#define DOS_MAX_PATHFILE_LENGTH (79)
 
 
 
@@ -78,16 +99,17 @@ IpAddr_t newIpAddr;
 IpAddr_t subnetMask;
 IpAddr_t gatewayAddr;
 IpAddr_t nameServer;
+IpAddr_t preferredNameServer;
 uint32_t offeredLeaseTime = 0;
 
+bool preferredNameServer_set = false;
 
 
 // Command line parameters
 
 uint8_t  Retries = 3;
-uint8_t  DumpPacketStats = 0;
 uint16_t Timeout = 10;
-uint32_t TimeoutMs = DHCP_TIMEOUT;
+uint32_t TimeoutMs = 10000ul;
 
 
 
@@ -115,13 +137,10 @@ void udpHandler2( Dhcp_t *resp );
 
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
-//
-// Check this flag once in a while to see if the user wants out.
-volatile uint8_t CtrlBreakDetected = 0;
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
 
-void ( __interrupt __far *oldCtrlBreakHandler)( );
+volatile uint8_t CtrlBreakDetected = 0;
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
@@ -129,15 +148,22 @@ void __interrupt __far ctrlBreakHandler( ) {
 
 
 
+int printIpAddr( FILE *stream, const char *name, IpAddr_t addr ) {
+  return fprintf( stream, "%s %d.%d.%d.%d\n", name, addr[0], addr[1], addr[2], addr[3] );
+}
 
-static char CopyrightMsg1[] = "mTCP DHCP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2013\n";
-static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
+
+
+const char *CheckYourCabling_msg = "Check your cabling and packet driver settings, including the hardware IRQ.";
+
+
+static char *CopyrightMsg = "mTCP DHCP Client by M Brutman (mbbrutman@gmail.com) (C)opyright 2008-2020\nVersion: " __DATE__ "\n\n";
 
 
 
 int main( int argc, char *argv[] ) {
 
-  printf( "%s  %s", CopyrightMsg1, CopyrightMsg2 );
+  printf( CopyrightMsg );
 
   parseArgs( argc, argv );
 
@@ -148,13 +174,11 @@ int main( int argc, char *argv[] ) {
     exit(1);
   }
 
+  Ip::setMyIpAddr( 0ul );
 
-
-  MyIpAddr[0] = MyIpAddr[1] = MyIpAddr[2] = MyIpAddr[3] = 0;
-
-  // No sockets, 1 xmit buffer
-  if ( Utils::initStack( 0, 1 ) ) {
-    puts( "Could not initialize TCP/IP stack\n" );
+  // No TCP sockets or TCP buffers
+  if ( Utils::initStack( 0, 0, ctrlBreakHandler, ctrlBreakHandler ) ) {
+    fprintf( stderr, "Could not initialize TCP/IP stack\n\n" );
     exit(1);
   }
 
@@ -162,26 +186,16 @@ int main( int argc, char *argv[] ) {
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
 
-  // Save off the old Ctrl-Break handler and enable our own.  Shutdown( )
-  // will restore the old handler for us.  Set the Ctrl-C handler to be the
-  // same routine, but don't worry about restoring it - DOS will do that
-  // for us.
-
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-  setvect( 0x23, ctrlBreakHandler);
-
 
   // This should never fail unless we build the library wrong.
   if ( Udp::registerCallback( DHCP_REPLY_PORT, &udpHandler ) ) {
-    puts( "Could not setup DHCP reply handler\n" );
+    fprintf( stderr, "Could not setup DHCP reply handler\n\n" );
     shutdown( 1 );
   }
 
-
-  printf( "Timeout per request: %u seconds, Retry attempts: %u\n", Timeout, Retries );
-  puts( "Sending DHCP requests, Press [ESC] to abort.\n" );
-
+  printf( "Timeout per request: %u seconds, Retry attempts: %u\n"
+          "Sending DHCP requests, Press [ESC] to abort.\n\n",
+          Timeout, Retries );
 
   // Delay 1 second; helps with some packet drivers that are not quite
   // ready to run by the time we send a packet out.
@@ -220,18 +234,20 @@ int main( int argc, char *argv[] ) {
 
     int8_t rc = createNewCfg( );
     if ( rc ) {
-      puts( "\nError: DHCP address was assigned but we had a problem writing the config file.\nNo changes were made." );
+      fprintf( stderr, "\n"
+                       "Error: DHCP address was assigned but we had a problem writing the config file.\n"
+                       "No changes were made.\n" );
     }
     else {
       finalRc = 0;
 
       puts( "\nGood news everyone!\n" );
 
-      printf( "%s = %d.%d.%d.%d\n", Parm_IpAddr, MyIpAddr[0], MyIpAddr[1], MyIpAddr[2], MyIpAddr[3] );
-      printf( "%s = %d.%d.%d.%d\n", Parm_Netmask, Netmask[0], Netmask[1], Netmask[2], Netmask[3] );
-      printf( "%s = %d.%d.%d.%d\n", Parm_Gateway, Gateway[0], Gateway[1], Gateway[2], Gateway[3] );
-      printf( "%s = %d.%d.%d.%d\n", Parm_Nameserver, nameServer[0], nameServer[1], nameServer[2], nameServer[3] );
-      printf( "LEASE_TIME = %lu seconds\n", offeredLeaseTime );
+      printIpAddr( stdout, Parm_IpAddr,     MyIpAddr );
+      printIpAddr( stdout, Parm_Netmask,    Netmask );
+      printIpAddr( stdout, Parm_Gateway,    Gateway );
+      printIpAddr( stdout, Parm_Nameserver, nameServer );
+      printf( "LEASE_TIME %lu seconds\n", offeredLeaseTime );
 
       printf( "\nSettings written to '%s'\n", CfgFilename );
 
@@ -244,14 +260,12 @@ int main( int argc, char *argv[] ) {
     // The most severe causes are checked for first.
 
     if ( Packets_send_errs == Packets_sent ) {
-      puts( "\nError: Your Ethernet card reported an error for every packet we sent.\n"
-            "Check your cabling and packet driver settings."
-      );
+      puts( "\nError: Your Ethernet card reported an error for every packet we sent." );
+      puts( CheckYourCabling_msg );
     }
     else if ( Packets_received == 0 ) {
-      puts( "\nError: Your DHCP server never responded and no packets were seen on the wire.\n"
-            "Check your cabling and packet driver settings."
-      );
+      puts( "\nError: Your DHCP server never responded and no packets were seen on the wire." );
+      puts( CheckYourCabling_msg );
     }
     else {
       puts( "\nError: Your DHCP server never responded, but your Ethernet card is receiving\n"
@@ -280,13 +294,13 @@ DhcpStatus_t makeAttempt( int i ) {
 
   DhcpStatusFlag = Dhcp_Start;
 
-  // This can't fail because ARP won't fail when broadcasting.
+  // This does not fail at ARP resolution because we are using the IP broadcast
+  // address which in turn becomes the local Ethernet broadcast address, and
+  // thus ARP resolution is not attempted.
   Udp::sendUdp( IpBroadcast, DHCP_REPLY_PORT, DHCP_REQUEST_PORT, reqLen, (uint8_t *)&req, 1 );
 
 
   printf( "DHCP request sent, attempt %d: ", i+1 );
-  fflush( stdout );
-
 
   // The UDP handler will update a global flag if it gets something.
 
@@ -296,16 +310,12 @@ DhcpStatus_t makeAttempt( int i ) {
 
     if ( CtrlBreakDetected ) {
       DhcpStatusFlag = Dhcp_UserAbort;
-      puts( "Ctrl-Break detected: aborting" );
-      break;
     }
 
     if ( bioskey(1) != 0 ) {
       char c = bioskey(0);
       if ( (c == 27) || (c == 3) ) {
         DhcpStatusFlag = Dhcp_UserAbort;
-        puts( "Ctrl-C or ESC detected: aborting" );
-        break;
       }
     }
 
@@ -325,127 +335,157 @@ DhcpStatus_t makeAttempt( int i ) {
 
   }
 
+  if ( DhcpStatusFlag == Dhcp_UserAbort ) {
+    puts( "Aborting" );
+  }
+
   return DhcpStatusFlag;
 }
 
 
 
 
-
 void shutdown( int rc ) {
-
-  setvect( 0x1b, oldCtrlBreakHandler);
-
   Utils::endStack( );
-
-  if ( DumpPacketStats ) {
-    Utils::dumpStats( stderr );
-  }
-
-  fclose( TrcStream );
   exit( rc );
 }
 
 
 
 
+
+void printErrno( const char *desc ) {
+  int localErrno = errno;
+  fprintf( stderr, "Error while %s: %s\n", desc, strerror( localErrno ) );
+}
+
+const char *Msg_writing_to_temp_file = "writing to temp file";
+
+
 int8_t createNewCfg( void ) {
 
-  // Read existing file
+  // Open the existing config file for reading and a new temp file for
+  // writing.  Everthing except the DHCP specific lines will be copied
+  // as is.  DHCP specific lines will be re-written.  The temp file will
+  // be created in the same directory, and if it is written successfully
+  // it will replace the old config file.
+
+  // Many of the error conditions here will never happen because we
+  // have already read the config file once.
 
   FILE *cfgFile = fopen( CfgFilename, "r" );
   if ( cfgFile == NULL ) {
-    // This shouldn't happen.  Bail out if it does.
-    puts( "Error: Config file disappeared?" );
+    printErrno( "opening config file" );
     return -1;
   }
 
+  // Normalize the path name, then extract the drive and pathname
+  // so we know where to create the temp file.
 
-  // Normalize the path name
-  char fullPath[ _MAX_PATH ];
+  char drive[ 3 ];
+  char dir[ DOS_MAX_PATH_LENGTH ];
+  char tmpFilename[ DOS_MAX_PATHFILE_LENGTH ];
 
-  if ( _fullpath( fullPath, CfgFilename, _MAX_PATH ) == NULL ) {
-    // This shouldn't happen either.
-    printf( "Error: '%s' is probably not a valid filename\n", CfgFilename );
+  if ( _fullpath( tmpFilename, CfgFilename, DOS_MAX_PATHFILE_LENGTH ) == NULL ) {
+    printErrno( "extracting path of config file" );
     return -1;
   }
 
-  // Now just get the path part
-  char drive[MAXDRIVE];
-  char dir[MAXDIR];
-
-  _splitpath( fullPath, drive, dir, NULL, NULL );
-
-  // Make new temp filename
-  char tmpFilename[ _MAX_PATH ];
-  _makepath( tmpFilename, drive, dir, "mtcpcfg", "tmp" );
-
+  _splitpath( tmpFilename, drive, dir, NULL, NULL );       // Returns no values.
+  _makepath( tmpFilename, drive, dir, "mtcpcfg", "tmp" );  // Returns no values.
 
   FILE *newFile = fopen( tmpFilename, "w" );
   if ( newFile == NULL ) {
-    printf( "Error: Could not create new config file\n" );
+    printErrno( "opening temp file for writing" );
     return -1;
   }
 
   time_t currentTime;
   time( &currentTime );
-  fprintf( newFile, "DHCPVER DHCP Client version %s\n", __DATE__ );
-  fprintf( newFile, "TIMESTAMP ( %lu ) %s", currentTime, ctime( &currentTime ) );
 
-  if ( cfgFile != NULL ) {
+  if ( (fprintf( newFile, "DHCPVER DHCP Client version %s\n", __DATE__ ) < 0) ||
+       (fprintf( newFile, "TIMESTAMP ( %lu ) %s", currentTime, ctime( &currentTime ) ) < 0) )
+  {
+    printErrno( Msg_writing_to_temp_file );
+    return -1;
+  }
 
-    char parmName[40];
-    char buffer[80];
+  char *parmName = Utils::parmName;
+  char *lineBuffer = Utils::lineBuffer;
 
-    while ( !feof( cfgFile ) ) {
+  int linesInFile = 0;
 
-      char *rc = fgets( buffer, 79, cfgFile );
-      if ( rc == NULL ) break;
+  while ( !feof( cfgFile ) ) {
 
-      int parmRc = sscanf( buffer, "%s", parmName );
-      if ( parmRc != 1 ) *parmName = 0;
+    linesInFile++;
 
-
-      if ( (stricmp( parmName, Parm_IpAddr ) == 0)     ||
-	   (stricmp( parmName, Parm_Gateway ) == 0)    ||
-	   (stricmp( parmName, Parm_Netmask ) == 0)    ||
-	   (stricmp( parmName, Parm_Nameserver ) == 0) ||
-	   (stricmp( parmName, "DHCPVER" ) == 0) ||
-	   (stricmp( parmName, "TIMESTAMP" ) == 0) ||
-	   (stricmp( parmName, "LEASE_TIME" ) == 0) )
-
-      {
-	// Do nothing .. we are going to fill these in
-      }
-      else {
-	fputs( buffer, newFile );
-      }
-
+    if ( Utils::getLine( cfgFile, false, lineBuffer, UTILS_LINEBUFFER_LEN, linesInFile ) ) {
+      // Line too long is an error.  We won't bother with the whitespace detection here.
+      return -1;
     }
 
-    fclose( cfgFile );
+    char *nextTokenPtr = Utils::getNextToken( lineBuffer, parmName, UTILS_PARAMETER_LEN );
 
+    if ( (stricmp( parmName, Parm_IpAddr ) == 0)     ||
+         (stricmp( parmName, Parm_Gateway ) == 0)    ||
+         (stricmp( parmName, Parm_Netmask ) == 0)    ||
+         (stricmp( parmName, Parm_Nameserver ) == 0) ||
+         (stricmp( parmName, "DHCPVER" ) == 0) ||
+         (stricmp( parmName, "TIMESTAMP" ) == 0) ||
+         (stricmp( parmName, "LEASE_TIME" ) == 0) )
+
+    {
+      // Do nothing .. we are going to fill these in
+    }
+    else {
+      if ( fputs( lineBuffer, newFile ) == EOF ) {
+        printErrno( Msg_writing_to_temp_file );
+        return -1;
+      }
+    }
+
+  } // end while
+
+  if ( fclose( cfgFile ) ) {
+    printErrno( "closing config file" );
+    return -1;
+  }
+
+
+  if ( preferredNameServer_set ) {
+    TRACE(( "Dhcp provided nameserver %u.%u.%u.%u replaced by user with %u.%u.%u.%u\n",
+            nameServer[0], nameServer[1], nameServer[2], nameServer[3],
+            preferredNameServer[0], preferredNameServer[1], preferredNameServer[2], preferredNameServer[3] ));
+    Ip::copy( nameServer, preferredNameServer );
   }
 
   // Write new values
-  fprintf( newFile, "%s %d.%d.%d.%d\n", Parm_IpAddr, MyIpAddr[0], MyIpAddr[1], MyIpAddr[2], MyIpAddr[3] );
-  fprintf( newFile, "%s %d.%d.%d.%d\n", Parm_Netmask, Netmask[0], Netmask[1], Netmask[2], Netmask[3] );
-  fprintf( newFile, "%s %d.%d.%d.%d\n", Parm_Gateway, Gateway[0], Gateway[1], Gateway[2], Gateway[3] );
-  fprintf( newFile, "%s %d.%d.%d.%d\n", Parm_Nameserver, nameServer[0], nameServer[1], nameServer[2], nameServer[3] );
-  fprintf( newFile, "LEASE_TIME %lu\n", offeredLeaseTime );
 
-  fclose( newFile );
+  if ( (printIpAddr( newFile, Parm_IpAddr,     MyIpAddr ) < 0 )   ||
+       (printIpAddr( newFile, Parm_Netmask,    Netmask ) < 0 )    ||
+       (printIpAddr( newFile, Parm_Gateway,    Gateway ) < 0 )    ||
+       (printIpAddr( newFile, Parm_Nameserver, nameServer ) < 0 ) ||
+       (fprintf( newFile, "LEASE_TIME %lu\n", offeredLeaseTime ) < 0 ) )
+  {
+    printErrno( Msg_writing_to_temp_file );
+    return -1;
+  }
+
+  if ( fclose( newFile ) ) {
+    printErrno( Msg_writing_to_temp_file );
+    return -1;
+  }
 
 
   int rc = unlink( CfgFilename );
   if ( rc != 0 ) {
-    printf( "Error deleting original config file '%s'\n", CfgFilename );
+    fprintf( stderr, "Error deleting original config file '%s'\n", CfgFilename );
     return -1;
   }
 
   rc = rename( tmpFilename, CfgFilename );
   if ( rc != 0 ) {
-    printf( "Error renaming '%s' to '%s'\n", tmpFilename, CfgFilename );
+    fprintf( stderr, "Error renaming '%s' to '%s'\n", tmpFilename, CfgFilename );
     return -1;
   }
 
@@ -459,36 +499,50 @@ int8_t parseEnv( void ) {
 
   CfgFilename = getenv( "MTCPCFG" );
   if ( CfgFilename == NULL ) {
-    printf( "Error: Need to set the MTCPCFG environment variable\n\n" );
-    printf( "Syntax is: set MTCPCFG=filename.ext\n" );
+    fprintf( stderr, "Error: You need to set the MTCPCFG environment variable to a valid config file.\n"
+                     "The syntax is: set MTCPCFG=filename.ext\n" );
     return -1;
   }
 
   FILE *cfgFile = fopen( CfgFilename, "r" );
   if ( cfgFile == NULL ) {
-    printf( "Error: Config file '%s' was not found.\n\n", CfgFilename );
-    printf( "At a minimum it has to have a PACKETINT setting.  Without that we can't\nsend and receive packets on the network.\n" );
+    fprintf( stderr, "Error: Not able to open the config file named '%s'.\n"
+                     "A config file is required.\n", CfgFilename );
     return -1;
   }
 
 
   uint16_t tmp1, tmp2, tmp3, tmp4;
 
-  char parmName[30];
-  char buffer[81];
   const char *errorParm = NULL;
+
+  uint8_t packetInt = 0;
+
+  bool errorWhileReadingLine = false;
+  bool trailingWhitespaceDetected = false;
+  int linesInFile = 0;
+
+  char *parmName = Utils::parmName;
+  char *lineBuffer = Utils::lineBuffer;
 
   while ( !feof( cfgFile ) && (errorParm == NULL) ) {
 
-    // Read a full line first. Fgets ensures room for the NULL
-    char *rc = fgets( buffer, 81, cfgFile );
-    if ( rc == NULL ) break;
+    linesInFile++;
 
-    char *nextTokenPtr = Utils::getNextToken( buffer, parmName, 30 );
+    if ( errorWhileReadingLine = Utils::getLine( cfgFile, true, lineBuffer, UTILS_LINEBUFFER_LEN, linesInFile ) ) {
+      break;
+    }
+
+    if ( Utils::rtrim( lineBuffer ) ) {
+      fprintf( stderr, "mTCP: Warning - trailing whitespace detected on line %u of the config file.\n", linesInFile );
+      trailingWhitespaceDetected = true;
+    }
+
+    char *nextTokenPtr = Utils::getNextToken( lineBuffer, parmName, UTILS_PARAMETER_LEN );
     if ( *parmName == 0 ) continue; // Blank line
 
     if ( stricmp( parmName, Parm_PacketInt ) == 0 ) {
-      int rc = sscanf( nextTokenPtr, "%x", &Packet_int );
+      int rc = sscanf( nextTokenPtr, "%x", &packetInt );
       if ( rc != 1 ) {
 	errorParm = Parm_PacketInt;
       }
@@ -510,42 +564,48 @@ int8_t parseEnv( void ) {
       MyMTU = newMtu;
     }
 
+    else if ( stricmp( parmName, Parm_Nameserver_preferred ) == 0 ) {
+
+      int rc = sscanf( nextTokenPtr, "%d.%d.%d.%d\n", &tmp1, &tmp2, &tmp3, &tmp4 );
+      if ( rc != 4 ) {
+        errorParm = Parm_Nameserver_preferred;
+      }
+      else {
+        preferredNameServer[0] = tmp1; preferredNameServer[1] = tmp2;
+        preferredNameServer[2] = tmp3; preferredNameServer[3] = tmp4;
+        preferredNameServer_set = true;
+      }
+
+    }
+
   }
 
   fclose( cfgFile );
 
+  if ( errorWhileReadingLine ) {
+    return -1;
+  }
+
+  if ( trailingWhitespaceDetected ) fprintf( stderr, "\n" );
+
+  if ( packetInt == 0x0 ) {
+    errorParm = Parm_PacketInt;
+  }
+
   if ( errorParm != NULL ) {
-    printf( "mTcp: '%s' is the wrong format or not set correctly.\n", errorParm );
+    fprintf( stderr, "mTcp: '%s' is the wrong format or not set correctly.\n", errorParm );
     return -1;
   }
 
-
-  if ( Packet_int == 0x0 ) {
-    printf( "mTCP: '%s' must be set.\n", errorParm );
-    return -1;
-  }
-
-
-  // Environment variables only
+  // We have to do this explicitly because we don't use Utils::parseEnv which
+  // would have set it.
   //
-  // We need to do this because we don't use Utils::initStack to read the
-  // config file or parse the environment variables.
+  Utils::setPacketInt( packetInt );
 
 
-  char *debugging  = getenv( "DEBUGGING" );
-  if ( debugging != NULL ) {
-    Utils::Debugging = atoi( debugging );
-  }
+  // Parse optional environment variables
+  Utils::parseOptionalEnvVars( );
 
-  char *logfile = getenv( "LOGFILE" );
-  if ( logfile != NULL ) {
-    strcpy( Utils::LogFile, logfile );
-  }
-
-  char *mtcpSleepVal = getenv( "MTCPSLEEP" );
-  if ( mtcpSleepVal != NULL ) {
-    mTCP_sleepCallEnabled = atoi( mtcpSleepVal );
-  }
 
   return 0;
 }
@@ -691,9 +751,9 @@ void udpHandler2( Dhcp_t *resp ) {
       DhcpStatusFlag = Dhcp_Ack;
 
       TRACE(( "Dhcp: All is good - finalize it\n" ));
-      Ip::copy( MyIpAddr, newIpAddr );
+      Ip::setMyIpAddr( newIpAddr );
+      Ip::setMyNetmask( subnetMask );
       Ip::copy( Gateway, gatewayAddr );
-      Ip::copy( Netmask, subnetMask );
       return;
     }
 
@@ -828,15 +888,16 @@ void udpHandler2( Dhcp_t *resp ) {
 
 
 
-void usage( void ) {
+void usage( FILE *stream ) {
 
-  puts( "\n"
-        "Dhcp [options]\n\n"
-        "Options:\n"
-        "  -help\n"
-        "  -retries <n>   Retry n times before giving up\n"
-        "  -timeout <n>   Set timeout for each attempt to n seconds\n"
-        "  -packetstats   Show packet statistics at the end\n"
+  fprintf( stream,
+    "\n"
+    "Dhcp [options]\n\n"
+    "Options:\n"
+    "  -help\n"
+    "  -retries <n>   Retry n times before giving up\n"
+    "  -timeout <n>   Set timeout for each attempt to n seconds\n"
+    "  -packetstats   Show packet statistics at the end\n\n"
   );
   exit( 1 );
 }
@@ -850,38 +911,35 @@ void parseArgs( int argc, char *argv[] ) {
     if ( stricmp( argv[i], "-retries" ) == 0 ) {
       i++;
       if ( i == argc ) {
-        puts( "Need to provide a number with the -retries option" );
-        usage( );
+        fprintf( stderr, "Need to provide a number with the -retries option\n" );
+        usage( stderr );
       }
       Retries = atoi( argv[i] );
       if ( Retries == 0 ) {
-        puts( "Bad number of retries specified" );
-        usage( );
+        fprintf( stderr, "Bad number of retries specified\n" );
+        usage( stderr );
       }
     }
     else if ( stricmp( argv[i], "-timeout" ) == 0 ) {
       i++;
       if ( i == argc ) {
-        puts( "Need to provide a number of seconds with the -timeout option" );
-        usage( );
+        fprintf( stderr, "Need to provide a number of seconds with the -timeout option\n" );
+        usage( stderr );
       }
       Timeout = atoi( argv[i] );
       if ( Timeout < 5 || Timeout > 120 ) {
-        puts( "Bad timeout value specified - must be between 5 and 120" );
-        usage( );
+        fprintf( stderr, "Bad timeout value specified - must be between 5 and 120\n" );
+        usage( stderr );
       }
       TimeoutMs = Timeout * 1000ul;
     }
     else if ( stricmp( argv[i], "-help" ) == 0 ) {
       printf( "Options and usage ...\n" );
-      usage( );
-    }
-    else if ( stricmp( argv[i], "-packetstats" ) == 0 ) {
-      DumpPacketStats = 1;
+      usage( stdout );
     }
     else {
-      printf( "Unknown option: %s\n", argv[i] );
-      usage( );
+      fprintf( stderr, "Unknown option: %s\n", argv[i] );
+      usage( stderr );
     }
 
   }

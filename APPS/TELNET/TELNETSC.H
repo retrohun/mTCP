@@ -1,8 +1,7 @@
-
 /*
 
    mTCP TelnetSc.h
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -28,6 +27,8 @@
 
    2013-03-15: Change cursor handling at right margin to mimic putty
    2011-05-27: Initial release as open source software
+   2015-01-22: Add 132 column support
+   2018-10-27: Add code to prevent CGA snow
 
 */
 
@@ -40,87 +41,7 @@
 #include <stdarg.h>
 
 #include "types.h"
-
-
-
-// We assume that we have an 80 column screen that that we devote all
-// 80 columns to the terminal window.  The primary reason is that the
-// number of columns is less than 80, we'll be able to shrink the virtual
-// screen correctly but not the real screen.  Which makes addressing
-// the real screen more complicated, and is not worth doing.
-
-#define SCREEN_COLS     (80)
-#define BYTES_PER_LINE (160)
-
-
-
-
-// Watcom specifics.
-
-#if defined ( __WATCOMC__ ) || defined ( __WATCOM_CPLUSPLUS__ )
-
-// Inline asm functions
-extern void fillUsingWord( uint16_t far * target, uint16_t fillWord, uint16_t len );
-#pragma aux fillUsingWord = \
-  "push es"    \
-  "push di"    \
-  "mov es, dx" \
-  "mov di, bx" \
-  "rep stosw"  \
-  "pop di"     \
-  "pop es"     \
-  modify [ax]  \
-  parm [dx bx] [ax] [cx]
-
-
-extern unsigned char wherex( void );
-#pragma aux wherex = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dl ];
-
-extern unsigned char wherey( void );
-#pragma aux wherey = \
-  "push bp"          \
-  "mov ah, 3h"       \
-  "mov bh, 0h"       \
-  "int 10h"          \
-  "pop bp"           \
-  modify [ ax bx cx dx ] \
-  value [ dh ];
-
-
-extern void gotoxy( unsigned char col, unsigned char row );
-#pragma aux gotoxy = \
-  "push bp"     \
-  "mov ah, 2h" \
-  "mov bh, 0h"  \
-  "int 10h" \
-  "pop bp"  \
-  parm [dl] [dh] \
-  modify [ax bh];
-
-
-extern void setCursor( void );
-#pragma aux setCursor = \
-  "mov ah, 1h"  \
-  "mov ch, 0h"  \
-  "mov cl, 7h"  \
-  "int 10h"     \
-  modify [ah cx];
-
-
-#
-
-
-
-#endif
-
-
+#include "inlines.h"
 
 
 
@@ -135,17 +56,23 @@ class Screen {
 
     void clearConsole( void );
 
-    void myCprintf( uint8_t attr, char *fmt, ... );
     void myCprintf( uint8_t x, uint8_t y, uint8_t attr, char *fmt, ... );
     void myCprintf_internal( uint8_t x, uint8_t y, uint8_t attr, char *fmt, va_list ap );
 
     inline void putch( uint8_t x, uint8_t y, uint8_t attr, char ch ) {
-      uint16_t far *start = (uint16_t far *)(Screen_base + (y*80+x)*2);
-      *start = (attr<<8 | ch );
+      uint16_t offset = ((y * terminalCols) + x) * 2;
+      uint16_t tmp = (attr<<8 | ch );
+      if ( preventSnow ) {
+        writeCharWithoutSnow( screenBaseSeg, offset, tmp );
+      } else {
+        uint16_t far *start = (uint16_t far *)(Screen_base + offset);
+        *start = tmp;
+      }
     }
 
     inline void repeatCh( uint8_t x, uint8_t y, uint8_t attr, char ch, uint8_t count ) {
-      uint16_t far *start = (uint16_t far *)(Screen_base + (y*80+x)*2);
+      uint16_t far *start = (uint16_t far *)(Screen_base + (y*terminalCols+x)*2);
+      if ( preventSnow ) { waitForCGARetraceLong( ); }
       fillUsingWord( start, (attr<<8) | ch, count );
     }
 
@@ -153,7 +80,7 @@ class Screen {
     // Compute the address of the physical screen location for a given x and y
 
     inline void updateVidBufPtr( void ) {
-      vidBufPtr = Screen_base + ( ((cursor_x<<1) + (cursor_y<<7) + (cursor_y<<5)) );
+      vidBufPtr = Screen_base + (cursor_x<<1) + (cursor_y*bytesPerLine);
     }
 
 
@@ -184,63 +111,132 @@ class Screen {
     inline uint16_t ScrOffset( uint16_t x, uint16_t y ) {
 
       uint32_t tmp = topOffset;
-      tmp = tmp + (y<<7)+(y<<5)+(x<<1);
+      tmp = tmp + y*bytesPerLine+(x<<1);
       if ( tmp >= bufferSize ) tmp = tmp - bufferSize;
 
       return tmp;
     }
 
 
-    // Used by ANSI emulation code
+    bool isColorCard( void ) { return colorCard; }
+    bool isPreventSnowOn( void ) { return preventSnow; }
+
+    inline uint16_t getScreenBaseSeg( void ) { return screenBaseSeg; }
+
+    void doNotUpdateRealScreen( void ) { updateRealScreen = false; }
+    bool isVirtualScreenUpdated( void ) { return virtualUpdated; }
+
+    void toggleWrapMode( void ) { wrapMode = !wrapMode; }
+    bool isWrapModeOn( void ) { return wrapMode; }
+
+
+    // The next set of methods are used by ANSI emulation code.
 
     void setHorizontal( int16_t newHorizontal );
     void setVertical( int16_t newVertical );
     void adjustVertical( int16_t delta );
 
+    void suppressOverhang( void ) {
+
+      // If we are waiting to wrap-around and an ESC sequence comes in
+      // then complete the wrap-around.  I can't find documentation that
+      // this is how it should work so this is reverse engineered.
+
+      if ( overhang ) {
+        cursor_x = 0;
+	scroll( );
+      }
+      overhang = false;
+    }
+
+    void saveCursor( void );
+    void restoreCursor( void );
+
+    void resetTerminalState( void );
 
 
-    // Class variables ...
 
-    uint16_t ScreenRows;        // How many rows on the screen?
-    uint16_t ScreenCols;        // How many columns?  (Will be 80)
+    // Public class variables ...
 
-    uint8_t  colorCard;         // 0=Monochrome, 1=CGA, EGA, or VGA
-    uint8_t  padding;
+    // Screen_base points to the start of the real frame buffer.  It is also
+    // used as an indicator that this class has been initialized.  If for some
+    // reason the class not been initialized correctly, it should be set to
+    // NULL.
 
     uint8_t far *Screen_base;
 
     uint16_t terminalLines;     // How many lines for the terminal window?
     uint16_t terminalCols;      // How many columns in our terminal window?
-    uint16_t totalLines;        // How many lines for viewable and backscroll?
-
-    uint8_t far *buffer;        // Start of virtual screen buffer
-    uint8_t far *bufferEnd;     // End of virtual screen buffer
-
-    uint16_t bufferSize;        // Size of buffer area in bytes
-    uint16_t topOffset;         // Offset in bytes to start of virtual screen
-
-    int16_t cursor_x, cursor_y; // X and Y for cursor
-
-
-    uint8_t far *vidBufPtr;     // Pointer into the real video buffer
-
-    uint8_t curAttr;            // Current screen attribute
-    uint8_t lastChar;           // Last printable char (used by some ANSI functions)
-
-    uint8_t updateRealScreen;   // Should we be updating the live screen?
-    uint8_t virtualUpdated;     // Have we updated the virtual screen?
-
-    uint16_t backScrollOffset;  // If backscrolling is active, how far back?
-
-    uint8_t wrapMode;           // Are we wrapping around lines?
-    bool    overhang;
 
 
     // Terminal emulation vars
 
-    int16_t scrollRegion_top, scrollRegion_bottom;
+    int16_t cursor_x;           // Cursor horizontal position
+    int16_t cursor_y;           // Cursor vertical position
+    int16_t scrollRegion_top;   // Top line of the scroll region
+    int16_t scrollRegion_bottom;// Bottom line of the scroll region
+
+    uint8_t curAttr;            // Current screen attribute
+    uint8_t lastChar;           // Last printable char (used by some ANSI functions)
+
     bool originMode;
     bool autoWrap;
+
+
+  private:
+
+    // Video card characteristics
+
+    bool     colorCard;         // Monochrome=false, CGA, EGA, or VGA=true
+    bool     preventSnow;       // Prevent CGA snow
+    uint16_t screenBaseSeg;     // Segment for the screen framebuffer
+    uint16_t bytesPerLine;      // How many bytes does a terminal line require?
+
+
+    // Virtual buffer characteristics
+
+    uint8_t far *buffer;        // Start of virtual screen buffer
+    uint8_t far *bufferEnd;     // End of virtual screen buffer
+    uint16_t     bufferSize;    // Size of buffer area in bytes
+    uint16_t     topOffset;     // Offset in bytes to start of virtual screen
+    uint16_t     totalLines;    // How many lines for viewable and backscroll?
+    uint16_t backScrollOffset;  // If backscrolling is active, how far back?
+
+
+    // Pointer to our current position on the real screen.
+    // This is sometimes out of date but it gets refreshed.
+
+    uint8_t far *vidBufPtr;     // Pointer into the real video buffer
+
+
+    // Used by the user interface to suppress screen updating or to know when
+    // a repaint is needed.
+
+    bool    updateRealScreen;   // Should we be updating the live screen?
+    bool    virtualUpdated;     // Have we updated the virtual screen?
+
+
+    // Toggles
+
+    uint8_t wrapMode;           // Are we wrapping around lines?
+
+
+    // Overhang is complex.  When a terminal prints in it's last column it
+    // does not immediately wrap to column 0.  This might be to allow for
+    // a backspace without having to wrap backwards or unscroll the screen.
+    // So we keep track of when we have printed a character in the last column
+    // but have not wrapped yet.
+    bool    overhang;
+
+    struct CursorSaveArea {
+      int16_t cursor_x;
+      int16_t cursor_y;
+      uint8_t curAttr;
+      bool    originMode;
+      bool    autoWrap;
+      uint8_t padding;
+    } cursorSaveArea;
+
 };
 
 

@@ -20,6 +20,7 @@
 # -zpw  Use with above; make sure you are warning free!
 # -0    8088/8086 class code generation
 # -s    disable stack overflow checking
+# -zmf  put each function in a new code segment; helps with linking
 
 # Even thought this code is interactive, performance is important.
 # Servers can flood us with data.
@@ -30,9 +31,9 @@ common_h_dir = ..\..\INCLUDE
 
 memory_model = -ml
 compile_options = -0 $(memory_model) -DCFG_H="telnet.cfg" -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+
-compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir) -DFILEXFER
+compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
-tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj
+tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj udp.obj utils.obj dns.obj timer.obj ipasm.obj trace.obj
 objs = telnet.obj telnetsc.obj keys.obj ymodem.obj
 
 all : clean telnet.exe
@@ -43,7 +44,7 @@ clean : .symbolic
   @del *.map
 
 patch : .symbolic
-  ..\..\utils\patch telnet.exe telnet.map $(memory_model)
+  ..\..\utils\ptach telnet.exe telnet.map $(memory_model)
 
 .asm : $(tcp_c_dir)
 
@@ -57,4 +58,4 @@ patch : .symbolic
 
 
 telnet.exe : $(tcpobjs) $(objs)
-  wlink system dos option map option stack=4096 name $@ file *.obj
+  wlink system dos option map option eliminate option stack=4096 name $@ file *.obj

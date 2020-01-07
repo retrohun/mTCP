@@ -1,8 +1,7 @@
-
 /*
 
    mTCP FtpSrv.cpp
-   Copyright (C) 2009-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2009-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -45,6 +44,7 @@
    2013-02-11: Enable SIZE command; have it throw an error in ASCII
                mode to avoid crushing the machine.
    2013-03-30: 132 column support/awareness; minor UI changes
+   2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
 
 */
 
@@ -68,8 +68,9 @@
 
 #include "types.h"
 
-#include "utils.h"
 #include "timer.h"
+#include "trace.h"
+#include "utils.h"
 #include "packet.h"
 #include "arp.h"
 #include "tcp.h"
@@ -219,17 +220,16 @@ void doConsoleStats( void );
 //
 
 
-// Trap Ctrl-Break and Ctrl-C so that we can unhook the timer interrupt
-// and shutdown cleanly.
 
-// Check this flag once in a while to see if the user wants out.
+// Ctrl-Break and Ctrl-C handler.  Check the flag once in a while to see if
+// the user wants out.
+
 volatile uint8_t CtrlBreakDetected = 0;
-
-void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 void __interrupt __far ctrlBreakHandler( ) {
   CtrlBreakDetected = 1;
 }
+
 
 
 
@@ -387,7 +387,7 @@ int doesExist( const char *realPath ) {
 
 
 
-static char CopyrightMsg1[] = "mTCP FtpSrv by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2013\n";
+static char CopyrightMsg1[] = "mTCP FtpSrv by M Brutman (mbbrutman@gmail.com) (C)opyright 2010-2020\n";
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 int main( int argc, char *argv[] ) {
@@ -623,10 +623,11 @@ void shutdown( int rc ) {
   gotoxy( 0, ScreenRows-1 );
 
   Utils::endStack( );
-  Utils::dumpStats( stdout );
-  fclose( TrcStream );
 
-  fclose( LogFile );
+  if ( LogFile != NULL ) {
+    fclose( LogFile );
+  }
+
   exit( rc );
 }
 
@@ -3284,12 +3285,18 @@ int convertToDosPath ( char *buffer_p ) {
 
   int i=3, j=9;
 
+  // Fix an obscure problem when somebody uses a sandbox but sets it to the
+  // root of a drive.  We wind up with a double slash which DOS gets upset
+  // about.
+
+  bool lastCharWasSlash = true;
   do {
     if ( buffer_p[j] == '/' ) {
-      rc[i++] = '\\';
+      if (!lastCharWasSlash) rc[i++] = '\\';
     }
     else {
       rc[i++] = buffer_p[j];
+      lastCharWasSlash = false;
     }
   }
   while ( buffer_p[j++] );
@@ -3404,11 +3411,10 @@ static int readConfigParms( void ) {
   }
 
 
-  // Logfile is required.
+  // Logfile is optional
 
   if ( Utils::getAppValue( "FTPSRV_LOG_FILE", LogFilename, DOS_MAX_PATHFILE_LENGTH ) ) {
-    addToScreen( 1, "Need to specify FTPSRV_LOG_FILE in mTCP config file\n" );
-    return 1;
+    addToScreen( 1, "Warning: A log file is not being used.\n\n" );
   }
 
 
@@ -3660,6 +3666,11 @@ static int initSrv( void ) {
     return 1;
   }
 
+  // Turn on mTCP tracing (if requested) as soon as possible.  This is normally
+  // done but Utils::initStack but that does not happen for a while.
+  Trace_beginTracing( );
+
+
   // Once our IP address is known set our default address that will
   // be advertised on the PASV command.  This might be overridden
   // when we read our application specific config parms.
@@ -3685,10 +3696,12 @@ static int initSrv( void ) {
   // See if we can open the log file for append.  Before this there is no
   // logging to the FTP server log.
 
-  LogFile = fopen( LogFilename, "ac" );
-  if ( LogFile == NULL ) {
-    addToScreen( 1, "\nCan't open logfile for writing.\n" );
-    return 1;
+  if ( *LogFilename ) {
+    LogFile = fopen( LogFilename, "ac" );
+    if ( LogFile == NULL ) {
+      addToScreen( 1, "\nCan't open logfile for writing.\n" );
+      return 1;
+    }
   }
 
   addToScreen( 1, "mTCP FtpSrv version (" __DATE__ ") starting\n\n" );
@@ -3716,7 +3729,7 @@ static int initSrv( void ) {
   }
 
 
-  if ( Utils::initStack( requestedSockets, requestedTcpBuffers ) ) {
+  if ( Utils::initStack( requestedSockets, requestedTcpBuffers, ctrlBreakHandler, ctrlBreakHandler ) ) {
     addToScreen( 1, "\nFailed to initialize TCP/IP - exiting\n" );
     return 1;
   }
@@ -3724,14 +3737,6 @@ static int initSrv( void ) {
 
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
-
-  // Save off the oldCtrlBreakHander and put our own in.  Shutdown( ) will
-  // restore the original handler for us.
-  oldCtrlBreakHandler = getvect( 0x1b );
-  setvect( 0x1b, ctrlBreakHandler);
-
-  // Get the Ctrl-C interrupt too, but do nothing.
-  setvect( 0x23, ctrlBreakHandler);
 
 
   uint16_t dosv = dosVersion( );
@@ -3889,13 +3894,12 @@ void addToScreen( int writeLog, const char *fmt, ... ) {
   getdate( &currentDate );
 
 
-  if ( writeLog && LogFile != NULL ) {
+  if ( writeLog && (LogFile != NULL) ) {
     // Write FTP log
-    fprintf( LogFile, "%04d-%02d-%02d %02d:%02d:%02d.%02d ",
+    fprintf( LogFile, "%04d-%02d-%02d %02d:%02d:%02d.%02d %s",
              currentDate.year, currentDate.month, currentDate.day,
              currentTime.hour, currentTime.minute, currentTime.second,
-             currentTime.hsecond );
-    fprintf( LogFile, "%s", logLineBuffer );
+             currentTime.hsecond, logLineBuffer );
     // Add to mTCP log (if it is active).
     TRACE(( "Ftp %s", logLineBuffer ));
     fflush( LogFile );

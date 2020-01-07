@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Ip.cpp
-   Copyright (C) 2005-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2005-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -39,17 +38,22 @@
 #include <stdio.h>
 
 
-#include "IP.h"
-#include "Packet.h"
-#include "Arp.h"
-#include "Timer.h"
+#include "eth.h"
+#include "ip.h"
+#include "packet.h"
+#include "timer.h"
+#include "trace.h"
+
+#ifdef COMPILE_ARP
+#include "arp.h"
+#endif
 
 #ifdef COMPILE_TCP
-#include "Tcp.h"
+#include "tcp.h"
 #endif
 
 #ifdef COMPILE_UDP
-#include "Udp.h"
+#include "udp.h"
 #endif
 
 
@@ -74,8 +78,6 @@ IpAddr_t IpThisMachine = { 0, 0, 0, 0 }; // This network and This host
 
 // Statistics
 
-uint32_t Ip::tcpRecvPackets = 0;
-uint32_t Ip::udpRecvPackets = 0;
 uint32_t Ip::icmpRecvPackets = 0;
 uint32_t Ip::ptrWrapCorrected = 0;
 uint32_t Ip::badChecksum = 0;
@@ -110,26 +112,32 @@ void Ip::dumpStats( FILE *stream ) {
   // Used to have Ip::ptrWrapCorrected, ran out of room
 
   // Standard stats we show everybody
-  fprintf( stream, "Ip: TcpRcv: %lu UdpRcv: %lu IcmpRcv: %lu Frags: %lu CSumE: %lu ProtE: %lu\n",
-           Ip::tcpRecvPackets, Ip::udpRecvPackets, Ip::icmpRecvPackets,
-           Ip::fragsReceived, Ip::badChecksum, Ip::unhandledProtocol );
+  fprintf( stream, "Ip:  Icmp Rcvd %lu Frags Rcvd %lu Checksum errs %lu No Handler %lu\n",
+           Ip::icmpRecvPackets, Ip::fragsReceived, Ip::badChecksum, Ip::unhandledProtocol );
+
 
   #ifdef IP_FRAGMENTS_ON
 
   // These stats only appear if debugging is turned on.
 
-  if ( Utils::Debugging && stream == TrcStream ) {
-    fprintf( stream, "    Good: %lu Timeout: %lu NoSlots: %lu TooMany: %lu SizeOvr: %lu\n",
+  #ifndef NOTRACE
+  if ( Trace_Debugging ) {
+    fprintf( stream, "     Frags: Good %lu Timeout %lu NoSlots %lu TooMany %lu SizeOvr %lu\n",
              Ip::goodReassemblies, Ip::timeoutReassemblies, Ip::notEnoughSlots,
              Ip::tooManyInFlight, Ip::payloadTooBig );
   }
+  #endif
 
   #endif
 }
 
 
 
-/* Standard algorithm for IP style checksum */
+/* Standard algorithm for IP style checksum
+
+   This code hasn't been used in ages.  mTCP is currently using the assembler
+   routines.
+
 
 uint16_t simpleChecksum( uint16_t *data_p, uint16_t len ) {
 
@@ -153,8 +161,6 @@ uint16_t simpleChecksum( uint16_t *data_p, uint16_t len ) {
 
   return ~sum;
 }
-
-/*
 
 uint16_t Ip::genericChecksum( uint16_t *data_p, uint16_t len ) {
   return simpleChecksum( data_p, len );
@@ -982,7 +988,7 @@ static uint8_t * processFragment( IpHeader *ip, uint8_t *packet ) {
 
 
 
-void Ip::process( uint8_t *packet ) {
+void Ip::process( uint8_t *packet, uint16_t packetLen ) {
 
   IpHeader *ip = (IpHeader *)(packet + sizeof(EthHeader) );
 
@@ -1043,7 +1049,6 @@ void Ip::process( uint8_t *packet ) {
 
   #ifdef COMPILE_TCP
   if ( ip->protocol == IP_PROTOCOL_TCP ) {
-    tcpRecvPackets++;
     Tcp::process( packet, ip );
   }
   else
@@ -1051,7 +1056,6 @@ void Ip::process( uint8_t *packet ) {
 
   #ifdef COMPILE_UDP
   if ( ip->protocol == IP_PROTOCOL_UDP ) {
-    udpRecvPackets++;
     Udp::process( packet, ip );
   } else
   #endif
@@ -1149,7 +1153,7 @@ void IpHeader::set( uint8_t protocol_p, const IpAddr_t dstHost,
 //
 // - Loopback - not implemented
 
-int8_t IpHeader::setDestEth( EthAddr_t *ethTarget ) {
+int8_t IpHeader::setDestEth( EthAddr_t ethTarget ) {
 
 
   // Historically we've always had IP addresses as char[4], which is easy
@@ -1161,42 +1165,40 @@ int8_t IpHeader::setDestEth( EthAddr_t *ethTarget ) {
   // If you wanted to use the char[4] version you'd have to do three
   // byte swaps to get it in the right order.
 
-  uint32_t destIpAddr = ((uint32_t)ip_dest[0] << 24) | ((uint32_t)ip_dest[1] << 16) |
-                        ((uint32_t)ip_dest[2] << 8 ) | ((uint32_t)ip_dest[3]);
+  uint32_t destIpAddr_u = *(uint32_t *)(&ip_dest);
 
-  // Is this limited broadcast?
-  if ( destIpAddr == 0xfffffffful ) {
-    Eth::copy( *ethTarget, Eth::Eth_Broadcast );
+  // Is this a global broadcast?
+  if ( destIpAddr_u == 0xfffffffful ) {
+    Eth::copy( ethTarget, Eth::Eth_Broadcast );
     return 0;
   }
 
-  int rc;
 
-  /*
-  TRACE(( "%d.%d.%d.%d\n", ip_dest[0], ip_dest[1], ip_dest[2], ip_dest[3] ));
-  TRACE(( "myipaddr_u: %08lx   netmask_u: %08lx    dest: %08lx\n", MyIpAddr_u, Netmask_u, destIpAddr ));
-  TRACE(( "%08lx    %08lx\n", (MyIpAddr_u & Netmask_u), (destIpAddr & Netmask_u) ));
-  */
+  // Probably the only program that does not have ARP compiled in is the DHCP
+  // client.  If you need ARP and you fail to compile it in you are going to
+  // have a bad time.
+  //
+  // DHCP does not get tripped up by this because it goes through the
+  // broadcast code above.
 
-  if ( (MyIpAddr_u & Netmask_u) != (destIpAddr & Netmask_u) ) {
-    rc = Arp::resolve( Gateway, ethTarget );
-  }
-  else {
+  #ifdef COMPILE_ARP
 
-    /* Experimental code; handle directed broadcast to our
-       own network.  Not terribly useful though.
-    uint32_t targetHost = destIpAddr & (~Netmask_u);
-    if ( targetHost == ((~Netmask_u) & 0xfffffffful) ) {
-      // Directed broadcast on our own network.  Can't arp that.
-      Eth::copy( *ethTarget, Eth::Eth_Broadcast );
-      return 0;
+    int rc;
+
+    if ( (MyIpAddr_u & Netmask_u) != (destIpAddr_u & Netmask_u) ) {
+      rc = Arp::resolve( Gateway, ethTarget );
     }
-    */
+    else {
+      rc = Arp::resolve( ip_dest, ethTarget );
+    }
 
-    rc = Arp::resolve( ip_dest, ethTarget );
-  }
+    return rc;
 
-  return rc;
+  #else
+
+    return -1;
+
+  #endif
 
 }
 
@@ -1302,7 +1304,10 @@ void near Icmp::process( uint8_t *packet, IpHeader *ip ) {
               ));
 
 
-    } // end if safe len
+      // end if safe len
+    } else {
+      TRACE_IP_WARN(( "Icmp: Packet too long to reply too.\n" ));
+    }
 
   } // end if echo request
 

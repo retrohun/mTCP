@@ -1,8 +1,7 @@
-
 /*
 
    mTCP Udp.H
-   Copyright (C) 2006-2013 Michael B. Brutman (mbbrutman@gmail.com)
+   Copyright (C) 2006-2020 Michael B. Brutman (mbbrutman@gmail.com)
    mTCP web page: http://www.brutman.com/mTCP
 
 
@@ -27,22 +26,29 @@
    Changes:
 
    2011-05-27: Initial release as open source software
+   2014-05-26: Add some static checks to the configuration options
 
 */
-
-
 
 
 #ifndef _UDP_H
 #define _UDP_H
 
 
-#include CFG_H
+// Load and check the configuration options
 
+#include CFG_H
 #include "types.h"
+
+static_assert( UDP_MAX_CALLBACKS >=  1 );
+static_assert( UDP_MAX_CALLBACKS <= 16 );
+
+
+
+// Continue with other includes
+
 #include "eth.h"
 #include "ip.h"
-#include "utils.h"
 
 
 
@@ -94,6 +100,15 @@ class Udp {
     static int8_t unregisterCallback( uint16_t port );
 
 
+    static void dumpStats( FILE *stream );
+
+    static uint32_t Packets_Sent;
+    static uint32_t Fragments_Sent;
+    static uint32_t Packets_Received;
+    static uint32_t NoHandler;
+    static uint32_t ChecksumErrors;
+
+
   private:
 
     static uint16_t  callbackList[ UDP_MAX_CALLBACKS ];
@@ -103,8 +118,6 @@ class Udp {
 				   const UdpHeader *udp);
 
 };
-
-
 
 
 #endif
