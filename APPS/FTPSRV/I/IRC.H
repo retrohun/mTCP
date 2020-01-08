@@ -1,0 +1,2 @@
+#include "..\..\..\INCLUDE\IRC.H"
+

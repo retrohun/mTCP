@@ -25,9 +25,9 @@
 
 # This code is big by nature, so throw in a few more options to improve performance.
 
-tcp_h_dir = ..\..\TCPINC\
-tcp_c_dir = ..\..\TCPLIB\
-common_h_dir = ..\..\INCLUDE
+tcp_h_dir = TI\
+tcp_c_dir = TL\
+common_h_dir = I
 
 memory_model = -ml
 compile_options = -0 $(memory_model) -DCFG_H="ftp.cfg" -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+
