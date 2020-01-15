@@ -35,7 +35,9 @@
 */
 
 
+#if DOSTERM == 0
 #include <bios.h>
+#endif
 #include <dos.h>
 #include <io.h>
 #include <stdlib.h>
@@ -89,6 +91,30 @@ void __interrupt __far ctrlCHandler( ) {
 }
 
 
+#if DOSTERM == 1
+uint16_t bioskey( int intarg ) {
+    union REGS regs;
+    uint16_t returnvalue;
+
+    if(1 == intarg){
+	regs.h.ah = 0x0b;
+	intdos(&regs, &regs);
+	return(regs.h.al & 1);
+    }
+    if(0 == intarg){
+	regs.h.ah = 0x08;
+	intdos(&regs, &regs);
+	returnvalue = regs.h.al;
+	if(returnvalue == 0) {
+	    regs.h.ah = 0x08;
+	    intdos(&regs, &regs);
+	    returnvalue = regs.h.al << 8;
+	}
+	return(returnvalue);
+    }
+    return(0);
+}
+#endif
 
 
 
@@ -191,9 +217,15 @@ int main( int argc, char *argv[] ) {
         break;
       }
 
+      #if DOSTERM == 1
+      if ( bioskey(1) != 0 ) {
+
+        char c = bioskeyd(0);
+      #else
       if ( _bios_keybrd(1) != 0 ) {
 
         char c = _bios_keybrd(0);
+      #endif
 
         if ( (c == 27) || (c == 3) ) {
           rc = -1;
@@ -254,9 +286,15 @@ int main( int argc, char *argv[] ) {
       done = 1;
     }
 
+    #if DOSTERM == 1
     if ( _bios_keybrd(1) ) {
 
       uint16_t key = _bios_keybrd(0);
+    #else
+    if ( bioskey(1) ) {
+
+      uint16_t key = bioskey(0);
+    #endif
       char ch = key & 0xff;
 
       if ( ch == 0 ) {

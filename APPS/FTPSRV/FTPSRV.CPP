@@ -53,8 +53,9 @@
 // RFC  765 - File Transfer Protocol specification
 // RFC 1579 - Firewall-Friendly FTP
 
-
+#if DOSTERM == 0
 #include <bios.h>
+#endif
 #include <ctype.h>
 #include <direct.h>
 #include <dos.h>
@@ -382,7 +383,30 @@ int doesExist( const char *realPath ) {
   return 0;
 }
 
+#if DOSTERM == 1
+uint16_t bioskey( int intarg ) {
+    union REGS regs;
+    uint16_t returnvalue;
 
+    if(1 == intarg){
+        regs.h.ah = 0x0b;
+        intdos(&regs, &regs);
+        return(regs.h.al & 1);
+    }
+    if(0 == intarg){
+        regs.h.ah = 0x08;
+        intdos(&regs, &regs);
+        returnvalue = regs.h.al;
+        if(returnvalue == 0) {
+            regs.h.ah = 0x08;
+            intdos(&regs, &regs);
+            returnvalue = regs.h.al << 8;
+        }
+        return(returnvalue);
+    }
+    return(0);
+}
+#endif
 
 
 
@@ -391,6 +415,10 @@ static char CopyrightMsg1[] = "mTCP FtpSrv by M Brutman (mbbrutman@gmail.com) (C
 static char CopyrightMsg2[] = "Version: " __DATE__ "\n\n";
 
 int main( int argc, char *argv[] ) {
+#if DOSTERM == 1
+int printTrash = 0;
+#endif
+
 
   initScreen( );
 
@@ -398,9 +426,11 @@ int main( int argc, char *argv[] ) {
 
   if ( initSrv( ) ) {
     addToScreen( 1, "\nServer can not start - exiting\n" );
+    #if DOSTERM == 0
     scrollMsgArea( 2 );
 
     gotoxy( 0, ScreenRows-1 );
+    #endif
     exit( 1 );
   }
 
@@ -474,6 +504,9 @@ int main( int argc, char *argv[] ) {
 
     if ( Timer_diff( lastKeyboardCheck, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS( 1000 ) ) {
 
+      #if DOSTERM == 1
+      if(printTrash)
+      #endif
       redrawStatusLine( );
 
       lastKeyboardCheck = TIMER_GET_CURRENT( );
@@ -528,6 +561,28 @@ int main( int argc, char *argv[] ) {
               if ( key == 3 ) {
                 shutdownRequested++;
               }
+              #if DOSTERM == 1
+              else if ( key == 0x70 ) {        // Alt-P, Trashprint
+                printTrash = 1 - printTrash;
+              }
+              else if ( key == 0x75 ) {        // Alt-U, Users
+                doConsoleShowUsers( );
+              }
+              else if ( key == 0x73 ) {   // Alt-S, Help
+                doConsoleStats( );
+              }
+              else if ( key == 0x68 ) {   // Alt-H, Help
+                doConsoleHelp( );
+              }
+              else if ( key == 0x78 ) {   // Alt-X, EndProgram
+                shutdownRequested++;
+              }
+              else if ( key == 0x62 ) {   // Alt-B, BeepToggle
+                Sound = !Sound;
+                showBeepState( );
+              }
+              #endif
+
 
             }
 
@@ -620,7 +675,9 @@ void shutdown( int rc ) {
 
   scrollMsgArea( 2 );
 
+  #if DOSTERM == 0
   gotoxy( 0, ScreenRows-1 );
+  #endif
 
   Utils::endStack( );
 
@@ -3847,9 +3904,11 @@ static unsigned _my_dos_findnext( struct find_t *buffer ) {
 
 
 void scrollMsgArea( int lines ) {
+  #if DOSTERM == 0
   memmove( (void *)(Screen_base + 2*(ScreenCols*2)), (void *)(Screen_base + (2+lines)*(ScreenCols*2)), ((ScreenRows-2)-lines)*(ScreenCols*2) );
   uint16_t far *start = (uint16_t far *)(Screen_base + (ScreenRows-lines)*(ScreenCols*2));
   fillUsingWord( start, (7<<8), lines*ScreenCols);
+  #endif
 }
 
 
@@ -3949,11 +4008,20 @@ void addToScreen( int writeLog, const char *fmt, ... ) {
   x = 0;
   for ( uint16_t i = 0; i < bytesOut; i++ ) {
     if ( logLineBuffer[i] == 10 ) {
+      #if DOSTERM == 0
       start += (ScreenCols-x);
       x = 0;
+      #else
+      x = 0;
+      printf("\n");
+      #endif
     }
     else {
+      #if DOSTERM == 0
       *start++ = ( attr | logLineBuffer[i] );
+      #else
+      printf("%c", logLineBuffer[i]);
+      #endif
       x++;
       if ( x == ScreenCols ) {
         x = 0;
@@ -3985,10 +4053,16 @@ void myCprintf( uint8_t x, uint8_t y, uint8_t attr, char *fmt, ... ) {
     bytesOut = 24;
   }
 
+  #if DOSTERM == 0
   uint16_t far *start = (uint16_t far *)(Screen_base + (y*ScreenCols+x)*2);
+  #endif
 
   for ( uint16_t i = 0; i < bytesOut; i++ ) {
+    #if DOSTERM == 0
     *start++ = ( attr << 8 | logLineBuffer[i] );
+    #else
+    printf("%c", logLineBuffer[i]);
+    #endif
   }
 
 }
@@ -4017,6 +4091,7 @@ void redrawStatusLine( void ) {
 void initScreen( void ) {
 
   // This always works:
+#if DOSTERM == 0
   unsigned char screenMode = *((unsigned char far *)MK_FP( 0x40, 0x49 ));
 
   if ( screenMode == 7 ) {
@@ -4048,6 +4123,7 @@ void initScreen( void ) {
 
   redrawStatusLine( );
   showBeepState( );
+#endif
 
 }
 

@@ -15,7 +15,9 @@
 */
 
 
+#if DOSTERM == 0
 #include <bios.h>
+#endif
 #include <conio.h>
 #include <dos.h>
 #include <stdio.h>
@@ -108,6 +110,31 @@ const char *BadPacketDriverErrMsg = "Error initializing packet driver - was that
 const char *BadHandleErrMsg = "Bad handle: Int: 0x%x, Handle: %x\n";
 
 const char CopyrightMsg[] = "\nmTCP pkttool by M Brutman (mbbrutman@gmail.com) (C)opyright 2012-2020\nVersion: " __DATE__ "\n";
+
+#if DOSTERM == 1
+uint16_t bioskey( int intarg ) {
+    union REGS regs;
+    uint16_t returnvalue;
+
+    if(1 == intarg){
+	regs.h.ah = 0x0b;
+	intdos(&regs, &regs);
+	return(regs.h.al & 1);
+    }
+    if(0 == intarg){
+	regs.h.ah = 0x08;
+	intdos(&regs, &regs);
+	returnvalue = regs.h.al;
+	if(returnvalue == 0) {
+	    regs.h.ah = 0x08;
+	    intdos(&regs, &regs);
+	    returnvalue = regs.h.al << 8;
+	}
+	return(returnvalue);
+    }
+    return(0);
+}
+#endif
 
 int main( int argc, char *argv[] ) {
 

@@ -34,8 +34,9 @@
 
 */
 
-
+#if DOSTERM == 0
 #include <bios.h>
+#endif
 #include <io.h>
 #include <fcntl.h>
 
@@ -247,6 +248,31 @@ void __interrupt __far ctrlBreakHandler( ) {
 }
 
 
+
+#if DOSTERM == 1
+uint16_t bioskey( int intarg ) {
+    union REGS regs;
+    uint16_t returnvalue;
+
+    if(1 == intarg){
+        regs.h.ah = 0x0b;
+        intdos(&regs, &regs);
+        return(regs.h.al & 1);
+    }
+    if(0 == intarg){
+        regs.h.ah = 0x08;
+        intdos(&regs, &regs);
+        returnvalue = regs.h.al;
+        if(returnvalue == 0) {
+            regs.h.ah = 0x08;
+            intdos(&regs, &regs);
+            returnvalue = regs.h.al << 8;
+        }
+        return(returnvalue);
+    }
+    return(0);
+}
+#endif
 
 
 uint8_t userWantsOut( void ) {

@@ -33,7 +33,7 @@ common_h_dir = I
 
 memory_model = -ml
 #compile_options = -0 $(memory_model) -DCFG_H="ftpsrv.cfg" -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+ -oe
-compile_options = -0 $(memory_model) -DCFG_H="ftpsrv.cfg" -oh -ok -ot -s -oa -ei -zp2 -zpw -we -ob -ol+ -oi+
+compile_options = -0 $(memory_model) -DCFG_H="ftpsrv.cfg" -oh -ok -ot -s -oa -ei -we -ob -ol+ -oi+
 compile_options += -i=$(tcp_h_dir) -i=$(common_h_dir)
 
 tcpobjs = packet.obj arp.obj eth.obj ip.obj tcp.obj tcpsockm.obj  utils.obj timer.obj ipasm.obj trace.obj
