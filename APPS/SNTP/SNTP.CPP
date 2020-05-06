@@ -303,10 +303,14 @@ int main( int argc, char *argv[] ) {
 
     int rc = sendRequest( );
 
-    if ( rc ) {
-      puts( "Arp failure sending request - check your gateway setting" );
+    if ( rc == 1 ) {
+      // We timed out ... try again
       continue;
+    } else if ( rc == -1 ) {
+      puts( "Error: Unable to send UDP packets!" );
+      break;
     }
+      
 
 
     // Spin again until we get a response
@@ -477,11 +481,14 @@ int8_t sendRequest( void ) {
   int rc = Udp::sendUdp( ServerAddr, 1024, ServerPort, reqLen,
                          (uint8_t *)&Outgoing, 1 );
 
+  if ( rc == -1 ) return -1;
+
   // Spin and process packets until we can resolve ARP and send our request
   while ( rc == 1 ) {
 
     if ( Timer_diff( startTime, TIMER_GET_CURRENT( ) ) > TIMER_MS_TO_TICKS( 2000 ) ) {
       TRACE_WARN(( "Sntp: Arp timeout sending request\n" ));
+      puts( "Warning: ARP timeout sending request - check your gateway setting" );
       return -1;
     }
 
@@ -490,6 +497,8 @@ int8_t sendRequest( void ) {
 
     rc = Udp::sendUdp( ServerAddr, 1024, ServerPort, reqLen,
                        (uint8_t *)&Outgoing, 1 );
+
+    if ( rc == -1 ) return -1;
 
   }
 

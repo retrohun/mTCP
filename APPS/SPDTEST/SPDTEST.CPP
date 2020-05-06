@@ -27,30 +27,59 @@
 
    2011-05-27: Initial release as open source software
    2015-01-18: Minor change to Ctrl-Break and Ctrl-C handling.
+   2020-03-06: Bug fix: Outgoing TCP packets are not always carrying
+               1460 bytes; the user might have a smaller MTU set.
+               Add some stats on avg packet size and warnings for
+               suboptimal MTU and MSS sizes.  Remove testing of
+               undocumented environment variables.  Remove srcport
+               option which was probably never used.
 
 */
 
 
-
-// Based on the original netcat code; everything is stripped out
+// Purpose
+//
+// This program can be used to test the speed of TCP sends and receives.
+// No real work is done with the data that is sent or received; the point
+// is to find the upper limit on what the TCP stack can do given a
+// particular machine.  A real use of TCP/IP would presumably do some
+// processing which takes time.
+//
+// This code is based on the original netcat code; everything is stripped out
 // that doesn't need to be here.
 //
-// The RECV_INTERFACE define needs some explanation.  My original TCP
-// code did not have a ring buffer for incoming data - it expected the
-// user app to read raw packets instead of calling something that looks
-// like a recv syscall.  This is faster because it avoids a memcpy, but
-// it is more error prone because a user might forget to return the buffer
-// to the TCP stack, thus running it out of incoming buffers.
+// The code should be run against a fast machine on the local network.  The
+// maximum possible MTU size should be used.  Timing varies from machine to
+// machine depending on how long interrupts get disabled on the machine, so
+// use the other machine to time the test or use wall time.
 //
-// If RECV_INTERFACE is set we'll tell the TCP stack to setup a receive
-// buffer for incoming data, which is how a normal user would expect
-// to get data from a socket.  If it is not set, we make the code snarf
-// data from raw packets.  Both options are present so that I can exercise
-// both code paths to maintain them.
 //
-// Data is sent using a pretty low level interface too.  Don't program
-// like this in your own apps. :-)  (This is the only app I have that
-// still uses these interfaces.  They might not exist in future versions.)
+// Receive performance testing:
+//
+// There are two ways to compile this gated by the RECV_INTERFACE flag.
+//
+// With that flag undefined the code uses a lower level API where received
+// data is presented in the packet it was received.  The user code is given
+// ownership of the incoming packet buffer and can examine everything.
+// This API is unnatural and probably should never be used.  However it does
+// skip some memcopies which is important for finding out the maximum speed
+// of the machine.
+//
+// The more realistic test has the flag turned on.  With that API TCP will
+// buffer bytes in a receive buffer owned by the socket.  User code gets
+// that data using the recv call on the socket.  This is more natural way
+// receive data and nearly all of the mTCP programs use this API instead.
+// However, don't use it unless you want to find the speed of the stack
+// relative to the other API.  Testing memcpy speed is not productive.
+//
+//
+// Send performance testing:
+//
+// This program cheats and uses a low level API to send data.  With that
+// API the user fills in a transmit buffer and hands it to the TCP stack
+// to send.  Contrast that to calling "send" on a socket where you provide
+// bytes and the TCP library fills in the outgoing packets.  That involves
+// extra memcpy operations though, so it is slower.
 
 
 #include <bios.h>
@@ -75,29 +104,20 @@
 #include "dns.h"
 
 
-// RECV_INTERFACE adds another layer of buffering, which is more
-// convenient for the user but slower.  Use this option for testing,
-// but leave it turned off for performance.
-
-// #define RECV_INTERFACE
-
-
+// Function prototypes
 
 void parseArgs( int argc, char *argv[] );
-void parseEnv( void );
 void shutdown( int rc );
 void initTcpXmitBuffers( void );
 
 
+// Globals
 
 uint32_t SpeedTestBytes = 4194304ul;  // 4MB default
 
-
-
-
 char     serverAddrName[80];
 
-uint16_t SrcPort = 0;    // Randomly set unless specified.
+uint16_t Port = 0;       // Randomly set unless specified for -listen
 IpAddr_t serverAddr;     // Only used when we are a client.
 uint16_t serverPort;     // Only used when we are a client.
 int8_t   Listening = -1; // Are we the server (1) or the client (0)?
@@ -106,15 +126,40 @@ int8_t   Direction = -1; // Sending == 0, Receiving == 1
 uint32_t TotalBytesReceived = 0;
 uint32_t TotalBytesSent     = 0;
 
-// Can be overridden by environment variables
-uint16_t WRITE_BUF_SIZE = 8192;
+
+
+
+// RECV_INTERFACE is normally disabled.  See the block of comments above
+// what what it is and why we leave it disabled.
+// 
+// #define RECV_INTERFACE
 
 
 #ifdef RECV_INTERFACE
-uint16_t RCV_BUF_SIZE = 8192;
+
+// Congratulations, you have selected to use the high level recv call to read
+// data from your sockets.  This incurs more overhead because TCP will buffer
+// incoming data for you, but it is more natural than reading data from
+// individual packets.
+
+// Size of the TCP socket recv buffer to use.
+uint16_t RECV_BUF_SIZE = 16384;
+
+
+// If using the higher level TCP recv call to receive data (the RECV_INTERFACE)
+// then we need a buffer to receive data into.  We're never actually going to
+// do anything with this buffer, but a normal program would write it to disk
+// or do something with the contents.
+uint16_t WRITE_BUF_SIZE = 16384;
+
 #else
-uint16_t RCV_BUF_SIZE = 0;
+
+// Tell the TCP library not to allocate a recv buffer in the socket.
+uint16_t RECV_BUF_SIZE = 0;
+
 #endif
+
+
 
 
 
@@ -124,7 +169,7 @@ uint16_t RCV_BUF_SIZE = 0;
 // Used for outgoing data
 typedef struct {
   TcpBuffer b;
-  uint8_t data[1460];
+  uint8_t data[];  // Variable length; depends on the TCP MSS setting.
 } DataBuf;
 
 
@@ -150,7 +195,6 @@ int main( int argc, char *argv[] ) {
   printf( "%s  %s", CopyrightMsg1, CopyrightMsg2 );
 
   parseArgs( argc, argv );
-  parseEnv( );
 
 
   // Initialize TCP/IP
@@ -164,22 +208,15 @@ int main( int argc, char *argv[] ) {
     exit(-1);
   }
 
-
   // From this point forward you have to call the shutdown( ) routine to
   // exit because we have the timer interrupt hooked.
 
-
-  initTcpXmitBuffers( );
-
-
-  // Pick a random number for the source port.
-  // Utils::initStack has already seeded the random number generator.
-
-  if ( SrcPort == 0 ) {
-    SrcPort = rand( ) + 1024;
+  if ( MyMTU < 1500 ) {
+    printf( "Warning: MTU size is set to %u.  Less than 1500 lowers performance.\n\n",
+            MyMTU );
   }
 
-
+  initTcpXmitBuffers( );
 
   TcpSocket *mySocket;
 
@@ -218,20 +255,22 @@ int main( int argc, char *argv[] ) {
       shutdown( -1 );
     }
 
+    Port = rand( ) + 1024;
+
     printf( "Connecting to %d.%d.%d.%d:%u on local port %u\n\n",
             serverAddr[0], serverAddr[1], serverAddr[2], serverAddr[3],
-            serverPort, SrcPort );
+            serverPort, Port );
 
     mySocket = TcpSocketMgr::getSocket( );
-    mySocket->setRecvBuffer( RCV_BUF_SIZE );
-    rc = mySocket->connect( SrcPort, serverAddr, serverPort, 10000 );
+    mySocket->setRecvBuffer( RECV_BUF_SIZE );
+    rc = mySocket->connect( Port, serverAddr, serverPort, 10000 );
   }
   else {
 
-    printf( "Waiting for a connection on port %u. Press [ESC] to abort.\n\n", SrcPort );
+    printf( "Waiting for a connection on port %u. Press [ESC] to abort.\n\n", Port );
 
     TcpSocket *listeningSocket = TcpSocketMgr::getSocket( );
-    listeningSocket->listen( SrcPort, RCV_BUF_SIZE );
+    listeningSocket->listen( Port, RECV_BUF_SIZE );
 
     // Listen is non-blocking.  Need to wait
     while ( 1 ) {
@@ -250,7 +289,7 @@ int main( int argc, char *argv[] ) {
 	listeningSocket->close( );
 	TcpSocketMgr::freeSocket( listeningSocket );
 	rc = 0;
-	printf( "Connection received from %d.%d.%d.%d:%u\n",
+	printf( "Connection received from %d.%d.%d.%d:%u\n\n",
 		mySocket->dstHost[0], mySocket->dstHost[1],
 		mySocket->dstHost[2], mySocket->dstHost[3],
 		mySocket->dstPort );
@@ -283,11 +322,33 @@ int main( int argc, char *argv[] ) {
   gettime( &start );
 
 
+  // Even though we have a local MTU that sets the largest packet size we can
+  // accept, the remote side might have a lower limit.  So take our maximum
+  // sent size for a packet from the socket, not from our local MSS.
   int maxPacketSize = mySocket->maxEnqueueSize;
+
+  printf( "MTU: %u, Maximum Segment Size: Local: %u, Remote: %u\n",
+          MyMTU, TcpSocketMgr::MSS_to_advertise, mySocket->maxEnqueueSize );
+  if ( maxPacketSize < TcpSocketMgr::MSS_to_advertise ) {
+    printf( "Warning: Remote MSS is smaller than our MSS" );
+  }
 
 
 #ifdef RECV_INTERFACE
+
   uint8_t *fileWriteBuffer = (uint8_t *)malloc( WRITE_BUF_SIZE );
+
+  if ( fileWriteBuffer == NULL ) {
+    printf( "Not enough memory\n" );
+    shutdown( -1 );
+  }
+
+  uint16_t bytesToRead = WRITE_BUF_SIZE;
+
+#else
+
+  uint32_t packetsDequeued = 0;
+
 #endif
 
 
@@ -296,7 +357,6 @@ int main( int argc, char *argv[] ) {
 
 
   uint16_t bytesRead = 0;
-  uint16_t bytesToRead = WRITE_BUF_SIZE;
 
   uint16_t bytesToSend = 0;
   uint16_t bytesSent = 0;
@@ -360,23 +420,18 @@ int main( int argc, char *argv[] ) {
 
             // Buffer has been filled; normally it would be written or
             // processed, but here we are just simulating that.
-            //
-            // Consider implementing echo sometime.  Echo would have
-            // different behavior - it would send echos without delay.
-            // Flow control would be more difficult too.
 
-            // Done - setup to fill the buffer again.
+            // Setup to fill the buffer again.
 	    bytesToRead = WRITE_BUF_SIZE;
 	    bytesRead = 0;
 	  }
 	}
 	else {
-          // Error path
+          // Error path - the socket is probably dead.
 	  break;
 	}
 
       }
-
 
 #else
 
@@ -390,13 +445,18 @@ int main( int argc, char *argv[] ) {
 
       while ( packet = ((uint8_t *)mySocket->incoming.dequeue( )) ) {
 
+        packetsDequeued++;
+
 	IpHeader *ip = (IpHeader *)(packet + sizeof(EthHeader) );
 	TcpHeader *tcp = (TcpHeader *)(ip->payloadPtr( ));
 	uint8_t *userData = ((uint8_t *)tcp)+tcp->getTcpHlen( );
 	uint16_t len = ip->payloadLen( ) - tcp->getTcpHlen( );
 
+	// Well, we at least looked in the packet to find the length of
+	// user payload.
 	TotalBytesReceived += len;
 
+	// Return the packet so it can be reused.
 	Buffer_free( packet );
       }
 
@@ -413,7 +473,8 @@ int main( int argc, char *argv[] ) {
 
     // Send path
     //
-
+    // Sending always works the same way; we take the preformatted packets
+    // and enqueue them for sending.
 
     while ( SpeedTestBytes && mySocket->outgoing.hasRoom( ) && mySocket->sent.hasRoom( ) ) {
 
@@ -446,12 +507,9 @@ int main( int argc, char *argv[] ) {
   }  // end while
 
 
-
-
   mySocket->close( );
 
   TcpSocketMgr::freeSocket( mySocket );
-
 
   DosTime_t endTime;
   gettime( &endTime );
@@ -461,8 +519,26 @@ int main( int argc, char *argv[] ) {
 
   uint16_t t = Utils::timeDiff( start, endTime );
 
-  printf( "Elapsed time: %u.%03u   Bytes sent: %ld  Received: %ld\n",
+  printf( "Elapsed time: %u.%03u, Bytes sent: %lu, Received: %lu\n",
           (t/100), (t%1000), TotalBytesSent, TotalBytesReceived );
+
+  #ifndef RECV_INTERFACE
+    if ( packetsDequeued ) {
+      uint32_t avgPacketSize = (TotalBytesReceived*10ul) / packetsDequeued;
+      if (avgPacketSize % 10 >= 5) {
+        avgPacketSize = avgPacketSize / 10ul + 1;
+      } else {
+        avgPacketSize = avgPacketSize / 10ul ;
+      }
+      printf( "Data packets received: %lu, Avg packet size: %lu\n",
+              packetsDequeued, avgPacketSize );
+      if ( (packetsDequeued) > 20 && (avgPacketSize < TcpSocketMgr::MSS_to_advertise) ) {
+        printf( "Warning: avgerage packet size was smaller than expected.\n");
+      }
+    }
+  #endif
+
+  puts("");
 
   shutdown( 0 );
 
@@ -472,19 +548,16 @@ int main( int argc, char *argv[] ) {
 
 
 
-char *HelpText[] = {
-  "Usage:\n\n",
-  "  spdtest <mode> -target <ipaddr> <port> [-srcport <n>]\n",
-  "    or\n",
-  "  spdtest <mode> -listen <port> [options]\n\n",
-  "Mode is either:\n",
-  "  -receive      Do a receive test\n",
-  "  -send         Do a send test\n\n",
-  "Options:\n",
-  "  -srcport <n>  Specify local source port for socket when using -target\n",
-  "  -mb <n>       Megabytes to send during a send test\n",
-  NULL
-};
+char *HelpText =
+  "Usage:\n\n"
+  "  spdtest <mode> -target <ipaddr> <port> [send options]\n"
+  "    or\n"
+  "  spdtest <mode> -listen <port> [send options]\n\n"
+  "Mode is either:\n"
+  "  -receive      Do a receive test\n"
+  "  -send         Do a send test\n\n"
+  "Send options:\n"
+  "  -mb <n>       Megabytes to send during a send test\n";
 
 char *ErrorText[] = {
   "Specify -listen or -target, but not both",
@@ -492,21 +565,14 @@ char *ErrorText[] = {
 };
 
 
-
-
 void usage( void ) {
-  uint8_t i=0;
-  while ( HelpText[i] != NULL ) {
-    printf( HelpText[i] );
-    i++;
-  }
+  printf( HelpText );
   exit( 1 );
 }
 
 
 void errorMsg( char *msg ) {
-  puts( msg );
-  puts( "" );
+  printf( "%s\n\n", msg );
   usage( );
   exit( 1 );
 }
@@ -554,31 +620,13 @@ void parseArgs( int argc, char *argv[] ) {
       if ( i == argc ) {
         errorMsg( "Need to provide a port number with the -listen option" );
       }
-      SrcPort = atoi( argv[i] );
+      Port = atoi( argv[i] );
 
-      if ( SrcPort == 0 ) {
+      if ( Port == 0 ) {
 	errorMsg( "Use a non-zero port to listen on" );
       }
 
       Listening = 1;
-    }
-
-    else if ( stricmp( argv[i], "-srcport" ) == 0 ) {
-
-      if ( Listening == -1 ) {
-	errorMsg( "Specify target to connect to first" );
-      }
-
-      if ( Listening == 1 ) {
-	errorMsg( "Don't specify -srcport when listening" );
-      }
-
-      i++;
-      if ( i == argc ) {
-        errorMsg( "Need to provide a port number with the -srcport option" );
-      }
-      SrcPort = atoi( argv[i] );
-
     }
 
     else if ( stricmp( argv[i], "-send" ) == 0 ) {
@@ -634,35 +682,19 @@ void parseArgs( int argc, char *argv[] ) {
 }
 
 
-
-void parseEnv( void ) {
-
-  char *c;
-  #ifdef RECV_INTERFACE
-  c = getenv( "TCPRCVBUF" );
-  if ( c!= NULL ) {
-    RCV_BUF_SIZE = atoi( c );
-  }
-  #endif
-
-  c = getenv( "WRITEBUF" );
-  if ( c!= NULL ) {
-    uint16_t tmp = atoi( c );
-    if ( (tmp >= 512) && (tmp <=32768) ) WRITE_BUF_SIZE = tmp;
-  }
-}
-
-
-
-
 void shutdown( int rc ) {
   Utils::endStack( );
-  Utils::dumpStats( stderr );
+  Utils::dumpStats( stdout );
   exit( rc );
 }
 
 
 
+// initTcpXmitBuffers
+//
+// Initialize the buffers that will be used for sending data with a known
+// pattern.  This is not necessary at all but it helps debugging if we are
+// not sending what looks like random garbage in our packets.
 
 void initTcpXmitBuffers( void ) {
 
@@ -678,20 +710,25 @@ void initTcpXmitBuffers( void ) {
     }
   }
 
-  // Init data in the first one
+  // dataSize is the data portion of the packet, as the TCP and IP headers
+  // are already accounted for in the DataBuf structure.  This should
+  // match what was allocated in TcpBuffer::init.
 
-  for ( uint16_t j=0; j < 1460; j++ ) {
+  int dataSize = TcpSocketMgr::MSS_to_advertise;
+
+  // Initalize data in the first buffer and then use memcpy to copy it to
+  // the other buffers.
+
+  for ( uint16_t j=0; j < dataSize; j++ ) {
     buffers[0]->data[j] = (j%95)+32;
   }
 
-  // Memcpy to the other buffers
-
   for ( uint16_t i=1; i < OUTGOINGBUFFERS; i++ ) {
-    memcpy( buffers[i]->data, buffers[0]->data, 1460 );
+    memcpy( buffers[i]->data, buffers[0]->data, dataSize );
   }
 
 
-  // Return all buffers
+  // Return all buffers so that they can be used.
 
   for ( uint16_t i=0; i < OUTGOINGBUFFERS; i++ ) {
     TcpBuffer::returnXmitBuf( (TcpBuffer *)buffers[i] );

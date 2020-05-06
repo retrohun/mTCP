@@ -297,6 +297,9 @@ DhcpStatus_t makeAttempt( int i ) {
   // This does not fail at ARP resolution because we are using the IP broadcast
   // address which in turn becomes the local Ethernet broadcast address, and
   // thus ARP resolution is not attempted.
+  //
+  // It can fail for out of memory.  If it does it won't be obvious but a debug
+  // trace will show it.
   Udp::sendUdp( IpBroadcast, DHCP_REPLY_PORT, DHCP_REQUEST_PORT, reqLen, (uint8_t *)&req, 1 );
 
 
@@ -881,6 +884,7 @@ void udpHandler2( Dhcp_t *resp ) {
   uint16_t reqLen = 240+current;
 
   // This can't fail because we are broadcasting it.
+  // It can only fail if we are out of memory; a debug trace will show that.
   Udp::sendUdp( IpBroadcast, DHCP_REPLY_PORT, DHCP_REQUEST_PORT, reqLen, (uint8_t *)&req, 1 );
 }
 

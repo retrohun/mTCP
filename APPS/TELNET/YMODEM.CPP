@@ -63,6 +63,8 @@
 
 #define TEL_IAC (0xFF)
 
+#define EXTRA_FILE_BUFFER_SIZE (4096)
+
 
 
 // Globals for Ymodem download
@@ -266,7 +268,9 @@ static uint16_t xmodem_calcCRC(uint8_t *message, uint16_t nBytes) {
 
 void initForXmodem( void ) {
   xmodem_crcInit( );
-  ExtraFileBuffer = (char *)malloc( 4096 );
+  // It's ok to not check the return code here; if it is NULL we just won't
+  // use it.
+  ExtraFileBuffer = (char *)malloc( EXTRA_FILE_BUFFER_SIZE );
 }
 
 
@@ -1039,7 +1043,7 @@ int8_t Transfer_vars::processGoodPayload( void ) {
       return -1;
     }
 
-    if (ExtraFileBuffer) setvbuf( targetFile, ExtraFileBuffer, _IOFBF, 4096 );
+    if (ExtraFileBuffer) setvbuf( targetFile, ExtraFileBuffer, _IOFBF, EXTRA_FILE_BUFFER_SIZE );
 
     // If we know the filesize do an fseek out to the end to improve efficiency.
     // If the server is lying and says it is larger then we'll create too large of
@@ -1253,7 +1257,7 @@ uint16_t Transfer_vars::processSocket_UploadInternal( uint8_t *recvBuffer, uint1
           return len; // Eat all remaining chars
         }
 
-        if (ExtraFileBuffer) setvbuf( targetFile, ExtraFileBuffer, _IOFBF, 4096 );
+        if (ExtraFileBuffer) setvbuf( targetFile, ExtraFileBuffer, _IOFBF, EXTRA_FILE_BUFFER_SIZE );
 
         sendXmodemPacket( );
 

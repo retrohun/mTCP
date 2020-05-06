@@ -169,6 +169,7 @@ int8_t Udp::unregisterCallback( uint16_t port ) {
 // allocated memory.
 //
 // Return codes:
+//  -1 is bad - this is a hard error
 //   0 is good - packet was sent
 //   1 is pending ARP resolution; try again later.
 //
@@ -193,13 +194,8 @@ int8_t Udp::sendUdp( IpAddr_t host, uint16_t srcPort, uint16_t dstPort,
       return sendUdpFragments( host, srcPort, dstPort,
                                payloadLen, data, preAlloc );
     #else
-      // Return code 0 is the proper way to do this; it simulates the packet
-      // getting lost in transit, presumably because it is too big.  This is
-      // better than claiming an ARP failure or inventing another return code.
-      // The user will need warnings on to see it happen though.
-
       TRACE_UDP_WARN(( "Udp: Packet too big and cant fragment!\n" ));
-      return 0;
+      return -1;
     #endif
   }
 
@@ -210,8 +206,14 @@ int8_t Udp::sendUdp( IpAddr_t host, uint16_t srcPort, uint16_t dstPort,
   UdpPacket_t* packetPtr;
 
   if ( preAlloc == 0 ) {
+
     // Malloc space for headers and user data and then copy the user data in.
     packetPtr = (UdpPacket_t*)malloc( packetLen );
+    if ( packetPtr == NULL ) {
+      TRACE_UDP_WARN(( "Udp: malloc error sending data\n" ));
+      return -1;
+    }
+
     memcpy( ((uint8_t *)packetPtr) + sizeof(UdpPacket_t), data, payloadLen );
   }
   else {
@@ -285,6 +287,10 @@ int8_t Udp::sendUdpFragments( IpAddr_t host, uint16_t srcPort,
 
   uint16_t packetLen = MyMTU + sizeof(EthHeader);
   UdpPacket_t* packetPtr = (UdpPacket_t *)malloc( packetLen );
+  if ( packetPtr == NULL ) {
+      TRACE_UDP_WARN(( "Udp: malloc error sending fragments"\n ));
+      return -1;
+  }
 
 
   // Prealloc = 1 doesn't help if we are fragmenting.  But we still

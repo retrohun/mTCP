@@ -1,5 +1,0 @@
-..\..\TCPINC\ip.h(37): Error! E101: col(0) keyboard interrupt detected
-..\..\TCPINC\ip.h(37): Note! N393: col(0) included from ..\..\TCPINC\tcp.h(62)
-..\..\TCPINC\ip.h(37): Note! N393: col(0) included from ..\..\TCPLIB\tcpsockm.cpp(60)
-..\..\TCPINC\ip.h(36): Error! E077: col(9) missing matching #endif directive
-..\..\TCPINC\tcp.h(41): Error! E077: col(9) missing matching #endif directive

@@ -40,7 +40,6 @@
 #include <ctype.h>
 #include <conio.h>
 #include <dos.h>
-#include <malloc.h>
 #include <mem.h>
 #include <string.h>
 #include <stdarg.h>

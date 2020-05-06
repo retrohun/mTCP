@@ -274,6 +274,13 @@ void Dns::sendRequest( IpAddr_t resolver, const char *serverName, uint16_t ident
   int8_t rc = Udp::sendUdp( resolver, handlerPort, 53,
                             reqLen, (uint8_t *)&query, 1 );
 
+  if ( rc == -1 ) {
+    // Fatal error from UDP.  This probably never happens unless you are
+    // low on memory.  If it does happen a debug trace will expose it.
+    return;
+  }
+
+
   // Spin and process packets until we can resolve ARP and send our request
   while ( rc == 1 ) {
 
@@ -293,6 +300,12 @@ void Dns::sendRequest( IpAddr_t resolver, const char *serverName, uint16_t ident
 
     rc = Udp::sendUdp( resolver, handlerPort, 53,
                        reqLen, (uint8_t *)&query, 1 );
+
+    if ( rc == -1 ) {
+      // This should not happen at this point; it would have been caught
+      // up above the first time we send the UDP packet.
+      return;
+    }
 
   }
 

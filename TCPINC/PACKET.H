@@ -147,6 +147,46 @@ extern uint8_t  Buffer_next;
 
 
 
+// Packet driver interfacing
+//
+// From the packet driver specification version 1.09:
+//
+// 1  BAD_HANDLE       Invalid handle number
+// 2  NO_CLASS         No interfaces of specified class found
+// 3  NO_TYPE          No interfaces of specified type found
+// 4  NO_NUMBER        No interfaces of specified number found
+// 5  BAD_TYPE         Bad packet type specified
+// 6  NO_MULTICAST     This interface does not support multicast
+// 7  CANT_TERMINATE   This packet driver cannot terminate
+// 8  BAD_MODE         An invalid receiver mode was specified
+// 9  NO_SPACE         Operation failed because of insufficient space
+// 10 TYPE_INUSE       The type had previously been accessed, and not released
+// 11 BAD_COMMAND      The command was out of range, or not implemented
+// 12 CANT_SEND        The packet couldn't be sent (usually hardware error)
+// 13 CANT_SET         Hardware address couldn't be changed (more than 1 handle open)
+// 14 BAD_ADDRESS      Hardware address has bad length or format
+// 15 CANT_RESET       Couldn't reset interface (more than 1 handle open)
+
+
+// Useful constants
+
+#define PKTDRV_BASIC                       (1)
+#define PKTDRV_BASIC_EXTENDED              (2)
+#define PKTDRV_BASIC_HIGH_PERF             (5)
+#define PKTDRV_BASIC_HIGH_PERF_EXTENDED    (6)
+#define PKTDRV_NOT_INSTALLED             (255)
+
+typedef struct {
+  uint32_t packets_in;
+  uint32_t packets_out;
+  uint32_t bytes_in;
+  uint32_t bytes_out;
+  uint32_t errors_in;
+  uint32_t errors_out;
+  uint32_t packets_lost;
+} PacketStats_t;
+
+
 
 
 // Packet driver
@@ -221,23 +261,6 @@ extern uint32_t Packets_send_errs;
 extern uint32_t Packets_send_retries;
 
 
-// From the packet driver specification version 1.09:
-//
-// 1  BAD_HANDLE       Invalid handle number
-// 2  NO_CLASS         No interfaces of specified class found
-// 3  NO_TYPE          No interfaces of specified type found
-// 4  NO_NUMBER        No interfaces of specified number found
-// 5  BAD_TYPE         Bad packet type specified
-// 6  NO_MULTICAST     This interface does not support multicast
-// 7  CANT_TERMINATE   This packet driver cannot terminate
-// 8  BAD_MODE         An invalid receiver mode was specified
-// 9  NO_SPACE         Operation failed because of insufficient space
-// 10 TYPE_INUSE       The type had previously been accessed, and not released
-// 11 BAD_COMMAND      The command was out of range, or not implemented
-// 12 CANT_SEND        The packet couldn't be sent (usually hardware error)
-// 13 CANT_SET         Hardware address couldn't be changed (more than 1 handle open)
-// 14 BAD_ADDRESS      Hardware address has bad length or format
-// 15 CANT_RESET       Couldn't reset interface (more than 1 handle open)
 
 
 #endif

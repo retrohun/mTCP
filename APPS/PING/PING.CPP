@@ -42,6 +42,14 @@
 // Using this trick we can get sub millisecond accuracy out of the slowest
 // machines, which is a nice trick.  And it is much better than trying to
 // code processor dependent delay loops, which don't work anyway.
+//
+// Return codes
+//   0 - All good, and all sent packets received a response
+//   1 - Usage error
+//   2 - DNS error
+//   3 - No responses received
+//   4 - Some responses received
+//
 
 
 #include <conio.h>
@@ -219,7 +227,7 @@ int main( int argc, char *argv[] ) {
   // Query is no longer pending or we bailed out of the loop.
   if ( Dns::resolve( ServerName, ServerAddr, 0 ) != 0 ) {
     printf( "Error resolving server name: %s\n", ServerName );
-    shutdown( 1 );
+    shutdown( 2 );
   }
 
 
@@ -292,7 +300,7 @@ int main( int argc, char *argv[] ) {
 
   if ( arpRc ) {
     puts( "Timeout waiting for ARP response." );
-    shutdown( 1 );
+    shutdown( 3 );
   }
 
 
@@ -333,8 +341,14 @@ int main( int argc, char *argv[] ) {
 	    big, small );
   }
 
+  int rc = 4;
+  if ( PacketsSent == RepliesReceived ) {
+    rc = 0;
+  } else if ( RepliesReceived == 0 ) {
+    rc = 3;
+  }
 
-  shutdown( 0 );
+  shutdown( rc );
 
   return 0;
 }

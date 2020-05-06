@@ -11,6 +11,9 @@
                 and sniff packets on the wire.
 
    Changes: 2015-03: Initial version; adapted from the earlier diag tool.
+            2020-03-07: Fix some serious bugs were we called extended packet
+                        driver functions without knowing if they were
+                        available.
 
 */
 
@@ -87,19 +90,24 @@ void ( __interrupt __far *oldCtrlBreakHandler)( );
 
 
 // Return codes from main
-//
-//   0 - no error (in general)
-//   128 - usage error
-//   129 - other error
-//
-//   scan return codes
+
+#define PKTTOOL_RC_GOOD                  (0)
+#define PKTTOOL_RC_USAGE_ERROR         (128)
+#define PKTTOOL_RC_PKTDRV_NOT_FOUND    (129)
+#define PKTTOOL_RC_STATS_NOT_AVAIL     (130)
+#define PKTTOOL_RC_STATS_UNKNOWN_ERROR (131)
+#define PKTTOOL_RC_FILE_ERROR          (132)
+#define PKTTOOL_RC_MISC_ERROR          (150)
+
+// Additional return codes for Scan
 //
 //     n -> number of packet drivers found
 //
-//   listen return codes
+// Additional return codes for Listen
 //
-//     0 -> no packets received
-//     1 -> at least one packet received
+//     0 -> at least one packet received
+//     1 -> no packets received
+
 
 
 // Constant strings
@@ -113,11 +121,11 @@ int main( int argc, char *argv[] ) {
 
   puts( CopyrightMsg );
 
+  if ( argc < 2 ) usage( PKTTOOL_RC_USAGE_ERROR );
+
   buildHexUints( );
 
   int rc = 0;
-
-  if ( argc < 2 ) usage( 128 );
 
   int i = 1;
 
@@ -140,7 +148,7 @@ int main( int argc, char *argv[] ) {
     if ( i == argc ) {
       printf( "Need to provide a packet driver software interrupt with the %s option\n\n",
               (listen ? "listen" : "stats") );
-      usage( 128 );
+      usage( PKTTOOL_RC_USAGE_ERROR );
     }
 
     uint16_t targetSoftwareInt;
@@ -149,7 +157,7 @@ int main( int argc, char *argv[] ) {
       puts( "Parse error reading the packet driver software interrupt number.\n"
             "The format is 0xNN where NN are hexadecimal digits.  The usual range\n"
             "is between 0x60 and 0x80.\n" );
-      usage( 128 );
+      usage( PKTTOOL_RC_USAGE_ERROR );
     }
 
 
@@ -168,7 +176,7 @@ int main( int argc, char *argv[] ) {
           i++;
           if ( i == argc ) {
             puts( "You need to specify an output file with the -outputfile option.\n" );
-            usage( 128 );
+            usage( PKTTOOL_RC_USAGE_ERROR );
           }
 
           OutputFilenameArg = argv[i];
@@ -178,18 +186,18 @@ int main( int argc, char *argv[] ) {
           i++;
           if ( i == argc ) {
             puts( "You need to specify a length with the -s option.\n" );
-            usage( 128 );
+            usage( PKTTOOL_RC_USAGE_ERROR );
           }
 
           Snaplen = atoi( argv[i] );
           if ( Snaplen == 0 ) {
             puts( "Error: bad length for -s option\n" );
-            usage( 128 );
+            usage( PKTTOOL_RC_USAGE_ERROR );
           }
 
         } else {
           printf( "Unknown option: %s\n\n", argv[i] );
-          usage( 128 );
+          usage( PKTTOOL_RC_USAGE_ERROR );
         }
 
       }
@@ -203,7 +211,7 @@ int main( int argc, char *argv[] ) {
 
   } else {
     printf( "Unknown option: %s\n\n", argv[i] );
-    usage( 128 );
+    usage( PKTTOOL_RC_USAGE_ERROR );
   }
 
   return rc;
@@ -239,6 +247,13 @@ void usage( int rc ) {
 //=============================================================================
 //
 // Additional packet driver functions that are not needed in PACKET.CPP
+// Do not call these until you have registered with the packet driver.
+
+
+// Packet_getReceiveMode
+//
+// This is an extended packet driver function; don't call it unless your
+// packet driver supports extended functions.
 
 int Packet_getReceiveMode( void ) {
 
@@ -256,6 +271,11 @@ int Packet_getReceiveMode( void ) {
 }
 
 
+// Packet_setReceiveMode
+//
+// This is an extended packet driver function; don't call it unless your
+// packet driver supports extended functions.
+//
 int Packet_setReceiveMode( int newMode ) {
 
   union REGS inregs, outregs;
@@ -273,7 +293,7 @@ int Packet_setReceiveMode( int newMode ) {
 }
 
 
-int8_t Packet_driver_info( void ) {
+uint8_t Packet_driver_info( void ) {
 
   union REGS inregs, outregs;
   struct SREGS segregs;
@@ -299,9 +319,11 @@ int8_t Packet_driver_info( void ) {
   printf( "  Version: %u   Class: %u   Type: %u  Interface Number: %u\n",
              outregs.x.bx, outregs.h.ch, outregs.x.dx, outregs.h.cl );
 
-  printf( "  Function flag: %d  ", outregs.h.al );
+  uint8_t functionality = outregs.h.al;
 
-  switch ( outregs.h.al ) {
+  printf( "  Function flag: %u  ", functionality );
+
+  switch ( functionality ) {
     case 1: { puts( "(basic functions only)" ); break; }
     case 2: { puts( "(basic and extended functions)" ); break; }
     case 5: { puts( "(basic and high performance functions)" ); break; }
@@ -311,14 +333,20 @@ int8_t Packet_driver_info( void ) {
 
   printf( "  Current receive mode: " );
 
-  switch ( Packet_getReceiveMode( ) ) {
-    case 1: { puts( "receiver turned off" ); break; }
-    case 2: { puts( "packets for this MAC" ); break; }
-    case 3: { puts( "packets for this MAC and broadcast packets" ); break; }
-    case 4: { puts( "packets for this MAC, broadcast and limited multicast" ); break; }
-    case 5: { puts( "packets for this MAC, broadcast and all multicast" ); break; }
-    case 6: { puts( "all packets (promiscuous mode)" ); break; }
-    default: { puts( "(error reading receiver mode)" ); break; }
+  if ( (functionality != PKTDRV_BASIC_EXTENDED) && (functionality != PKTDRV_BASIC_HIGH_PERF_EXTENDED) ) {
+    puts( "Driver doesn't support this checking this." );
+  } else {
+
+    switch ( Packet_getReceiveMode( ) ) {
+      case 1: { puts( "receiver turned off" ); break; }
+      case 2: { puts( "packets for this MAC" ); break; }
+      case 3: { puts( "packets for this MAC and broadcast packets" ); break; }
+      case 4: { puts( "packets for this MAC, broadcast and limited multicast" ); break; }
+      case 5: { puts( "packets for this MAC, broadcast and all multicast" ); break; }
+      case 6: { puts( "all packets (promiscuous mode)" ); break; }
+      default: { puts( "(error reading receiver mode)" ); break; }
+    }
+
   }
 
   uint8_t ethAddr[6];
@@ -326,7 +354,7 @@ int8_t Packet_driver_info( void ) {
 
   printf( "  MAC address: %s\n\n", printMACAddr(ethAddr) );
 
-  return 0;
+  return functionality;
 }
 
 
@@ -857,19 +885,19 @@ int listenForPackets( uint16_t softwareInt ) {
     OutputFile = fopen( OutputFilenameArg, "w" );
     if ( OutputFile == NULL ) {
       fprintf( stderr, "Error: bad filename specified for -outputfile\n" );
-      return 129;
+      return PKTTOOL_RC_FILE_ERROR;
     }
   }
 
   if ( Buffer_init( ) ) {
     fprintf( stderr, "Init: Failed creating buffers\n" );
-    return 129;
+    return PKTTOOL_RC_MISC_ERROR;
   }
 
   int rc = Packet_init( softwareInt );
   if ( rc != 0 ) {
     puts( BadPacketDriverErrMsg );
-    return 129;
+    return PKTTOOL_RC_PKTDRV_NOT_FOUND;
   }
 
 
@@ -882,12 +910,22 @@ int listenForPackets( uint16_t softwareInt ) {
   setvect( 0x23, ctrlBreakHandler);
 
 
-  Packet_driver_info( );
+  uint8_t functionality = Packet_driver_info( );
+  bool receiveModeSupport = (functionality == PKTDRV_BASIC_EXTENDED) ||
+                            (functionality == PKTDRV_BASIC_HIGH_PERF_EXTENDED);
 
-  int oldReceiveMode = Packet_getReceiveMode( );
 
-  if ( Packet_setReceiveMode( 6 ) ) {
-    puts( "Warning - failed to set promiscuous mode on your Ethernet card.\n" );
+  // We won't use oldReceiveMode unless we know the driver supports it.
+  // We set it to a reasonable default either way.
+  int oldReceiveMode = 2;
+
+  if ( receiveModeSupport ) {
+    oldReceiveMode = Packet_getReceiveMode( );
+    if ( Packet_setReceiveMode( 6 ) ) {
+      puts( "Warning - failed to set promiscuous mode on your Ethernet card.\n" );
+    }
+  } else {
+    puts( "Warning: Not attempting to put your card in promiscuous mode.\n" );
   }
 
   puts( "Listening for incoming packets.  Press [ESC] to quit.\n" );
@@ -930,7 +968,7 @@ int listenForPackets( uint16_t softwareInt ) {
   EthernetStats::dumpAll( OutputFile );
   IpAddrTable::dumpTable( OutputFile );
 
-  if ( oldReceiveMode > 0 ) Packet_setReceiveMode( oldReceiveMode );
+  if ( receiveModeSupport ) Packet_setReceiveMode( oldReceiveMode );
 
   Buffer_stopReceiving( );
   Packet_release_type( );
@@ -944,7 +982,7 @@ int listenForPackets( uint16_t softwareInt ) {
     printf( "Trace and statistics were written to %s\n", OutputFilenameArg );
   }
 
-  return Packets_received ? 1 : 0;
+  return Packets_received ? 0 : 1;
 }
 
 
@@ -953,54 +991,64 @@ int listenForPackets( uint16_t softwareInt ) {
 
 int showPacketDriverStats( uint16_t softwareInt ) {
 
-  typedef struct {
-    uint32_t packets_in;
-    uint32_t packets_out;
-    uint32_t bytes_in;
-    uint32_t bytes_out;
-    uint32_t errors_in;
-    uint32_t errors_out;
-    uint32_t packets_lost;
-  } PacketStats_t;
-
-
-  int rc = Packet_init( softwareInt );
-  if ( rc == -1 ) {
+  if ( Packet_init( softwareInt ) ) {
     puts( BadPacketDriverErrMsg );
-    return 129;
+    return PKTTOOL_RC_PKTDRV_NOT_FOUND;
   }
 
-  Packet_driver_info( );
+  // From this point forward you can not do an early return because we
+  // registered with the packet driver.
 
-  union REGS inregs, outregs;
-  struct SREGS segregs;
+  int rc = -1;
 
-  inregs.h.ah = 0x18;
-  inregs.x.bx = Packet_getHandle( );
 
-  int86x( Packet_getSoftwareInt( ), &inregs, &outregs, &segregs );
+  // Find out if the packet driver supports statistics
+  uint8_t functionality = Packet_driver_info( );
 
-  if ( outregs.x.cflag ) {
-    printf( BadHandleErrMsg, Packet_getSoftwareInt( ), Packet_getHandle( ) );
-    return 129;
+  if ((functionality != PKTDRV_BASIC_EXTENDED) && (functionality != PKTDRV_BASIC_HIGH_PERF_EXTENDED)) {
+
+    puts( "This packet driver doesn't support extended functions.  Statistics\n"
+          "are not available." );
+    rc = PKTTOOL_RC_STATS_NOT_AVAIL;
+
+  } else {
+
+    union REGS inregs, outregs;
+    struct SREGS segregs;
+
+    inregs.h.ah = 0x18;
+    inregs.x.bx = Packet_getHandle( );
+
+    int86x( Packet_getSoftwareInt( ), &inregs, &outregs, &segregs );
+
+    if ( outregs.x.cflag ) {
+
+      puts( "Unknown error reading statistics from the packet driver." );
+      rc = PKTTOOL_RC_STATS_UNKNOWN_ERROR;
+
+    } else {
+
+      PacketStats_t far *stats = ( PacketStats_t far *)MK_FP( segregs.ds, outregs.x.si );
+
+      printf( "All statistics are from when the packet driver was loaded.\n\n"
+              "Packets in:   %10lu  Packets received\n"
+              "Packets out:  %10lu  Packets sent\n"
+              "Bytes in:     %10lu  Bytes received (includes Ethernet headers)\n"
+              "Bytes out:    %10lu  Bytes sent (includes Ethernet headers)\n"
+              "Errors in:    %10lu  Receive errors\n"
+              "Errors out:   %10lu  Sending errors\n"
+              "Packets lost: %10lu  Lost due to no packet handler, out of buffers, etc.\n",
+              stats->packets_in, stats->packets_out, stats->bytes_in, stats->bytes_out,
+              stats->errors_in, stats->errors_out, stats->packets_lost );
+
+      rc = PKTTOOL_RC_GOOD;
+    }
+
   }
-
-  PacketStats_t far *stats = ( PacketStats_t far *)MK_FP( segregs.ds, outregs.x.si );
-
-  printf( "All statistics are from when the packet driver was loaded.\n\n"
-            "Packets in:   %10lu  Packets received\n"
-            "Packets out:  %10lu  Packets sent\n"
-            "Bytes in:     %10lu  Bytes received (includes Ethernet headers)\n"
-            "Bytes out:    %10lu  Bytes sent (includes Ethernet headers)\n"
-            "Errors in:    %10lu  Receive errors\n"
-            "Errors out:   %10lu  Sending errors\n"
-            "Packets lost: %10lu  Lost due to no packet handler, out of buffers, etc.\n",
-          stats->packets_in, stats->packets_out, stats->bytes_in, stats->bytes_out,
-          stats->errors_in, stats->errors_out, stats->packets_lost );
 
   Packet_release_type( );
 
-  return 0;
+  return rc;
 }
 
 
